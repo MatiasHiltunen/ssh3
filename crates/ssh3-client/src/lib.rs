@@ -3304,6 +3304,156 @@ mod tests {
         let _ = server.wait().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_exec_capture_round_trips_with_extra_pubkey_algorithms_against_the_real_go_server(
+    ) {
+        let _guard = lock_go_binary_tests();
+
+        for (algorithm, label) in [
+            (AuthKeyAlgorithm::NistP256, "p256"),
+            (AuthKeyAlgorithm::Rsa, "rsa"),
+        ] {
+            let fixture = create_auth_fixture(algorithm);
+            let tempdir = TempDir::new().unwrap();
+            let home_dir = tempdir.path().join("home");
+            fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+            fs::write(
+                home_dir.join(".ssh").join("authorized_keys"),
+                fs::read(&fixture.authorized_identities_path).unwrap(),
+            )
+            .unwrap();
+
+            let bind_port = reserve_udp_port();
+            let bind_addr = format!("127.0.0.1:{bind_port}");
+            let cert_path = tempdir.path().join("cert.pem");
+            let key_path = tempdir.path().join("key.pem");
+            let log_path = tempdir.path().join("go-server.log");
+
+            let mut server = spawn_go_cli_server(
+                &bind_addr,
+                &fixture.username,
+                &home_dir,
+                &cert_path,
+                &key_path,
+                &log_path,
+            )
+            .await;
+
+            let mut config = ClientConfig::new(
+                format!(
+                    "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                    fixture.username
+                )
+                .parse()
+                .unwrap(),
+            );
+            config.trust = TrustStrategy::Insecure;
+            config.username = Some(fixture.username.clone());
+            config.identity_file = Some(fixture.private_key_path.clone());
+
+            let session = tokio::time::timeout(
+                Duration::from_secs(20),
+                run_exec_capture(&config, format!("echo hello from rust {label} to real go")),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(session.exit_status, 0, "{label}: {session:?}");
+            assert_eq!(
+                session.stdout,
+                format!("hello from rust {label} to real go\n").into_bytes(),
+                "{label}: {session:?}"
+            );
+            assert!(session.stderr.is_empty(), "{label}: {session:?}");
+            assert!(
+                session
+                    .server_header
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("SSH ")),
+                "{label}: {session:?}"
+            );
+
+            let _ = server.kill().await;
+            let _ = server.wait().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_exec_round_trips_with_oidc_against_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_oidc_fixture().await;
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+        fs::write(
+            home_dir.join(".ssh3").join("authorized_identities"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+
+        let bind_port = reserve_udp_port();
+        let bind_addr = format!("127.0.0.1:{bind_port}");
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+        let log_path = tempdir.path().join("go-server.log");
+
+        let mut server = spawn_go_cli_server(
+            &bind_addr,
+            &fixture.username,
+            &home_dir,
+            &cert_path,
+            &key_path,
+            &log_path,
+        )
+        .await;
+
+        let mut config = ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.oidc = Some(OidcConfig {
+            issuer_url: fixture.issuer_url.clone(),
+            client_id: fixture.client_id.clone(),
+            client_secret: None,
+            use_pkce: true,
+        });
+
+        let session = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_exec_capture_with_browser_opener(
+                &config,
+                "echo hello from rust oidc to real go",
+                mock_browser_opener,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(session.exit_status, 0, "{session:?}");
+        assert_eq!(session.stdout, b"hello from rust oidc to real go\n".to_vec());
+        assert!(session.stderr.is_empty(), "{session:?}");
+        assert!(
+            session
+                .server_header
+                .as_deref()
+                .is_some_and(|value| value.starts_with("SSH ")),
+            "{session:?}"
+        );
+
+        let _ = server.kill().await;
+        let _ = server.wait().await;
+    }
+
     #[tokio::test]
     async fn exec_capture_round_trips_with_ed25519_bearer_auth() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
