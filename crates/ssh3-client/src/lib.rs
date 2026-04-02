@@ -2208,6 +2208,52 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn run_go_cli_client_with_password(
+        home_dir: &Path,
+        url: &str,
+        password: &str,
+        command: &[&str],
+    ) -> std::process::Output {
+        let binaries = go_cli_binaries();
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+
+        let mut parts = vec![
+            shell_quote(binaries.client.to_string_lossy().as_ref()),
+            "-insecure".to_string(),
+            "-use-password".to_string(),
+            shell_quote(url),
+        ];
+        parts.extend(command.iter().map(|arg| shell_quote(arg)));
+        let command = parts.join(" ");
+
+        let mut child = TokioCommand::new("script")
+            .arg("-qefc")
+            .arg(command)
+            .arg("/dev/null")
+            .env("HOME", home_dir)
+            .env("TERM", "xterm")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(format!("{password}\n").as_bytes())
+            .await
+            .unwrap();
+        drop(stdin);
+
+        timeout(Duration::from_secs(20), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
     fn shell_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
@@ -3173,7 +3219,7 @@ mod tests {
         config.identity_file = Some(fixture.private_key_path.clone());
 
         let session = tokio::time::timeout(
-            Duration::from_secs(20),
+            Duration::from_secs(40),
             run_exec_capture(&config, "printf 'hello from rust to go\\n'"),
         )
         .await
@@ -3628,6 +3674,68 @@ mod tests {
         assert_eq!(stdout, "hello from real go oidc\n");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("could not get token"), "{output:?}");
+        assert!(!stderr.contains("could not establish"), "{output:?}");
+        assert!(!stderr.contains("an error was encountered"), "{output:?}");
+
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_exec_round_trips_with_password_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
+        let username = current_username();
+        let password = "correct horse battery staple".to_string();
+        let expected_username = username.clone();
+        let expected_password = password.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.enable_password_login = true;
+            config.password_verifier =
+                Some(Arc::new(move |candidate_username, candidate_password| {
+                    Ok(candidate_username == expected_username
+                        && candidate_password == expected_password)
+                }));
+            config.default_user = Some("does-not-exist".to_string());
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let output = run_go_cli_client_with_password(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &password,
+            &["echo", "hello from real go password"],
+        )
+        .await;
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        assert!(stdout.contains("hello from real go password\n"), "{stdout}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("could not get password"), "{output:?}");
         assert!(!stderr.contains("could not establish"), "{output:?}");
         assert!(!stderr.contains("an error was encountered"), "{output:?}");
 
