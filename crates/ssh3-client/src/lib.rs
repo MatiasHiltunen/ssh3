@@ -2083,7 +2083,6 @@ mod tests {
             .args(command)
             .env("HOME", home_dir)
             .env("SSH_AUTH_SOCK", agent_socket)
-            .env("SSH3_SKIP_AUTH_AGENT_INIT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2362,46 +2361,53 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let socket_path = tempdir.path().join("agent.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
+        let private_key = Arc::new(private_key);
         let sign_flags = Arc::new(Mutex::new(Vec::new()));
         let sign_flags_task = sign_flags.clone();
 
         let task = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
+                let private_key = private_key.clone();
+                let sign_flags = sign_flags_task.clone();
 
-                loop {
-                    let request = match read_agent_message(&mut stream).await {
-                        Ok(Some(request)) => request,
-                        Ok(None) => break,
-                        Err(err)
+                tokio::spawn(async move {
+                    loop {
+                        let request = match read_agent_message(&mut stream).await {
+                            Ok(Some(request)) => request,
+                            Ok(None) => break,
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    io::ErrorKind::BrokenPipe
+                                        | io::ErrorKind::ConnectionAborted
+                                        | io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::UnexpectedEof
+                                ) =>
+                            {
+                                break;
+                            }
+                            Err(err) => panic!("mock agent read failed: {err}"),
+                        };
+                        let response =
+                            handle_agent_request(&private_key, &sign_flags, request.as_slice())
+                                .unwrap();
+                        if let Err(err) =
+                            write_agent_message(&mut stream, response.as_slice()).await
+                        {
                             if matches!(
                                 err.kind(),
                                 io::ErrorKind::BrokenPipe
                                     | io::ErrorKind::ConnectionAborted
                                     | io::ErrorKind::ConnectionReset
                                     | io::ErrorKind::UnexpectedEof
-                            ) =>
-                        {
-                            break;
+                            ) {
+                                break;
+                            }
+                            panic!("mock agent write failed: {err}");
                         }
-                        Err(err) => panic!("mock agent read failed: {err}"),
-                    };
-                    let response =
-                        handle_agent_request(&private_key, &sign_flags_task, request.as_slice())
-                            .unwrap();
-                    if let Err(err) = write_agent_message(&mut stream, response.as_slice()).await {
-                        if matches!(
-                            err.kind(),
-                            io::ErrorKind::BrokenPipe
-                                | io::ErrorKind::ConnectionAborted
-                                | io::ErrorKind::ConnectionReset
-                                | io::ErrorKind::UnexpectedEof
-                        ) {
-                            break;
-                        }
-                        panic!("mock agent write failed: {err}");
                     }
-                }
+                });
             }
         });
 

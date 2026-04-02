@@ -294,11 +294,6 @@ func getConnectionMaterialFromURL(hostUrl *url.URL, sshConfig *ssh_config.Config
 
 	var agentClient agent.ExtendedAgent
 	socketPath := os.Getenv("SSH_AUTH_SOCK")
-	if os.Getenv("SSH3_SKIP_AUTH_AGENT_INIT") == "1" {
-		// Interop tests can bypass eager auth-agent setup and reserve SSH_AUTH_SOCK for
-		// forwarded-agent behavior only.
-		socketPath = ""
-	}
 	if socketPath != "" {
 		conn, err := net.Dial("unix", socketPath)
 		if err != nil {
