@@ -1853,6 +1853,97 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(unix)]
+    async fn run_go_cli_shell(
+        home_dir: &Path,
+        url: &str,
+        private_key_path: &Path,
+        input: &str,
+    ) -> std::process::Output {
+        let binaries = go_cli_binaries();
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+
+        let command = format!(
+            "{} -insecure -privkey {} {}",
+            shell_quote(binaries.client.to_string_lossy().as_ref()),
+            shell_quote(private_key_path.to_string_lossy().as_ref()),
+            shell_quote(url),
+        );
+
+        let mut child = TokioCommand::new("script")
+            .arg("-qefc")
+            .arg(command)
+            .arg("/dev/null")
+            .env("HOME", home_dir)
+            .env("TERM", "xterm")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.as_bytes()).await.unwrap();
+        drop(stdin);
+
+        timeout(Duration::from_secs(20), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn run_shell_capture_on_client(
+        client: &super::ActiveClient,
+        terminal: LocalTerminalInfo,
+        shell_input: &str,
+    ) -> Result<CapturedSession, ClientError> {
+        let channel = client.open_session_channel().await?;
+        send_initial_session_requests(channel.as_ref(), &SessionRequest::Shell, Some(&terminal))
+            .await?;
+        channel
+            .write_data(shell_input.as_bytes(), SSH_EXTENDED_DATA_NONE)
+            .await
+            .map_err(ClientError::from)?;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        loop {
+            match timeout(Duration::from_secs(10), channel.next_message())
+                .await
+                .unwrap()?
+            {
+                Message::Data(data) => match data.data_type {
+                    SSH_EXTENDED_DATA_NONE => stdout.extend_from_slice(&data.data),
+                    ssh3_proto::SSH_EXTENDED_DATA_STDERR => stderr.extend_from_slice(&data.data),
+                    _ => {}
+                },
+                Message::ChannelRequest(message) => match message.request {
+                    ChannelRequest::ExitStatus(status) => {
+                        return Ok(CapturedSession {
+                            server_header: client.server_header.clone(),
+                            exit_status: status.exit_status as i32,
+                            stdout,
+                            stderr,
+                        });
+                    }
+                    ChannelRequest::ExitSignal(signal) => {
+                        return Err(ClientError::ExitSignal(signal));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
     fn create_auth_fixture(algorithm: AuthKeyAlgorithm) -> AuthFixture {
         let tempdir = TempDir::new().unwrap();
         let private_key_path = tempdir.path().join("id_ed25519");
@@ -3004,6 +3095,147 @@ mod tests {
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
         assert_eq!(stdout, "hello from real go cli\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("could not establish"), "{output:?}");
+        assert!(!stderr.contains("an error was encountered"), "{output:?}");
+
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_shell_with_pty_round_trips_against_the_real_go_server() {
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+
+        let bind_port = reserve_udp_port();
+        let bind_addr = format!("127.0.0.1:{bind_port}");
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+        let log_path = tempdir.path().join("go-server.log");
+
+        let mut server = spawn_go_cli_server(
+            &bind_addr,
+            &fixture.username,
+            &home_dir,
+            &cert_path,
+            &key_path,
+            &log_path,
+        )
+        .await;
+
+        let mut config = ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+
+        let client = connect_client(&config).await.unwrap();
+        let session = timeout(
+            Duration::from_secs(15),
+            run_shell_capture_on_client(
+                &client,
+                LocalTerminalInfo {
+                    term: Some("xterm-256color".to_string()),
+                    size: TerminalSize {
+                        char_width: 80,
+                        char_height: 24,
+                        pixel_width: 640,
+                        pixel_height: 480,
+                    },
+                },
+                "stty size\nprintf '__SSH3_PTY_RUST_CLIENT_OK__:%s\\n' \"$TERM\"\nexit\n",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client.shutdown().await;
+
+        assert_eq!(session.exit_status, 0, "{session:?}");
+        let stdout = String::from_utf8_lossy(&session.stdout);
+        assert!(stdout.contains("24 80"), "{stdout}");
+        assert!(
+            stdout.contains("__SSH3_PTY_RUST_CLIENT_OK__:xterm-256color"),
+            "{stdout}"
+        );
+        assert!(
+            session
+                .server_header
+                .as_deref()
+                .is_some_and(|value| value.starts_with("SSH ")),
+            "{session:?}"
+        );
+
+        let _ = server.kill().await;
+        let _ = server.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_shell_with_pty_round_trips_against_the_rust_server() {
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let private_key_path = fixture.private_key_path.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let output = run_go_cli_shell(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &private_key_path,
+            "printf '__SSH3_PTY_GO_CLIENT_OK__:%s\\n' \"$TERM\"\nexit\n",
+        )
+        .await;
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        assert!(
+            stdout.contains("__SSH3_PTY_GO_CLIENT_OK__:xterm"),
+            "{stdout}"
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("could not establish"), "{output:?}");
         assert!(!stderr.contains("an error was encountered"), "{output:?}");
