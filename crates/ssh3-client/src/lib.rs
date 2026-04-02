@@ -420,6 +420,7 @@ struct ActiveClient {
     _send_request: SendRequest,
     driver_task: tokio::task::JoinHandle<()>,
     incoming_channels_task: tokio::task::JoinHandle<()>,
+    incoming_datagrams_task: tokio::task::JoinHandle<()>,
     server_header: Option<String>,
     max_packet_size: u64,
     default_datagrams_queue_size: usize,
@@ -430,6 +431,7 @@ impl ActiveClient {
         self.connection.close(0u32.into(), b"done");
         let _ = self.driver_task.await;
         let _ = self.incoming_channels_task.await;
+        let _ = self.incoming_datagrams_task.await;
         self.endpoint.wait_idle().await;
     }
 
@@ -1112,6 +1114,17 @@ async fn connect_client_with_browser_opener(
             }
         }
     });
+    let incoming_datagrams_task = tokio::spawn({
+        let connection = connection.clone();
+        let conversation = established.conversation.clone();
+        async move {
+            if let Err(err) = ssh3_h3::dispatch_datagrams_forever(conversation, connection).await
+                && !is_benign_datagram_dispatch_error(&err)
+            {
+                eprintln!("ssh3-client incoming datagram error: {err}");
+            }
+        }
+    });
 
     Ok(ActiveClient {
         endpoint,
@@ -1121,6 +1134,7 @@ async fn connect_client_with_browser_opener(
         _send_request: send_request,
         driver_task,
         incoming_channels_task,
+        incoming_datagrams_task,
         server_header: response_server_header(&established.response).map(str::to_owned),
         max_packet_size: config.max_packet_size,
         default_datagrams_queue_size: config.default_datagrams_queue_size,
@@ -1360,6 +1374,13 @@ fn is_benign_route_error(error: &RouteAcceptedChannelError) -> bool {
     )
 }
 
+fn is_benign_datagram_dispatch_error(error: &ssh3_h3::DatagramDispatchError) -> bool {
+    matches!(
+        error,
+        ssh3_h3::DatagramDispatchError::Connection(error) if is_benign_connection_error(error)
+    )
+}
+
 #[cfg(unix)]
 fn spawn_agent_forwarder(
     conversation: Arc<Conversation>,
@@ -1481,10 +1502,15 @@ mod tests {
         response_with_server_header,
     };
     use ssh3_proto::{ChannelRequest, Message, SSH_EXTENDED_DATA_NONE};
-    use ssh3_quinn::{accept_bi_channel, open_tcp_forwarding_channel, self_signed_server_config};
+    use ssh3_quinn::{
+        accept_bi_channel, open_tcp_forwarding_channel, open_udp_forwarding_channel,
+        self_signed_server_config,
+    };
     use ssh3_server::{ServerConfig, serve_connection};
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
+    use tokio::net::UdpSocket as TokioUdpSocket;
     use tokio::net::{TcpListener, TcpStream};
     #[cfg(unix)]
     use tokio::net::{UnixListener, UnixStream};
@@ -1722,6 +1748,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn spawn_udp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket =
+            TokioUdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut buf = [0; 4096];
+            loop {
+                let (n, peer) = match socket.recv_from(&mut buf).await {
+                    Ok(result) => result,
+                    Err(_) => return,
+                };
+                let _ = socket.send_to(&buf[..n], peer).await;
+            }
+        });
+        (addr, task)
+    }
+
+    #[cfg(unix)]
     async fn spawn_go_interop_server(
         bind_addr: &str,
         username: &str,
@@ -1913,6 +1959,64 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn spawn_go_cli_udp_forwarder(
+        home_dir: &Path,
+        url: &str,
+        private_key_path: &Path,
+        local_port: u16,
+        remote_addr: SocketAddr,
+        log_path: &Path,
+    ) -> tokio::process::Child {
+        let binaries = go_cli_binaries();
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+        let stderr_log = fs::File::create(log_path).unwrap();
+        let forward_spec = format!("{local_port}/{}@{}", remote_addr.ip(), remote_addr.port());
+        let mut child = TokioCommand::new(&binaries.client)
+            .arg("-insecure")
+            .arg("-privkey")
+            .arg(private_key_path)
+            .arg("-forward-udp")
+            .arg(&forward_spec)
+            .arg(url)
+            .arg("sleep")
+            .arg("8")
+            .env("HOME", home_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_log))
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_port));
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let logs = fs::read_to_string(log_path).unwrap_or_default();
+                    panic!(
+                        "go CLI UDP forwarder exited before the local port was bound with status {status}\nlogs:\n{logs}"
+                    );
+                }
+
+                match UdpSocket::bind(local_addr) {
+                    Ok(socket) => drop(socket),
+                    Err(err) if err.kind() == io::ErrorKind::AddrInUse => break,
+                    Err(err) => panic!(
+                        "could not probe local UDP forwarder port {local_addr}: {err}"
+                    ),
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        child
+    }
+
+    #[cfg(unix)]
     async fn run_go_cli_client(
         home_dir: &Path,
         url: &str,
@@ -2065,6 +2169,31 @@ mod tests {
         }
     }
 
+    async fn run_udp_forwarding_round_trip_on_client(
+        client: &super::ActiveClient,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        let channel = open_udp_forwarding_channel(
+            client.conversation.as_ref(),
+            &client.connection,
+            client.max_packet_size,
+            client.default_datagrams_queue_size,
+            remote_addr,
+        )
+        .await
+        .map_err(ClientError::from)?;
+        channel
+            .send_datagram(payload.to_vec())
+            .await
+            .map_err(ClientError::from)?;
+        let echoed = timeout(Duration::from_secs(10), channel.receive_datagram())
+            .await
+            .unwrap();
+        let _ = channel.close().await;
+        Ok(echoed)
+    }
+
     fn create_auth_fixture(algorithm: AuthKeyAlgorithm) -> AuthFixture {
         let tempdir = TempDir::new().unwrap();
         let private_key_path = tempdir.path().join("id_ed25519");
@@ -2158,13 +2287,38 @@ mod tests {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
 
-                while let Some(request) = read_agent_message(&mut stream).await.unwrap() {
+                loop {
+                    let request = match read_agent_message(&mut stream).await {
+                        Ok(Some(request)) => request,
+                        Ok(None) => break,
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::BrokenPipe
+                                    | io::ErrorKind::ConnectionAborted
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::UnexpectedEof
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(err) => panic!("mock agent read failed: {err}"),
+                    };
                     let response =
                         handle_agent_request(&private_key, &sign_flags_task, request.as_slice())
                             .unwrap();
-                    write_agent_message(&mut stream, response.as_slice())
-                        .await
-                        .unwrap();
+                    if let Err(err) = write_agent_message(&mut stream, response.as_slice()).await {
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::UnexpectedEof
+                        ) {
+                            break;
+                        }
+                        panic!("mock agent write failed: {err}");
+                    }
                 }
             }
         });
@@ -3530,6 +3684,149 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn rust_client_udp_forwarding_round_trips_against_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+
+        let bind_port = reserve_udp_port();
+        let bind_addr = format!("127.0.0.1:{bind_port}");
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+        let log_path = tempdir.path().join("go-server.log");
+        let (remote_addr, echo_task) = spawn_udp_echo_server().await;
+
+        let mut server = spawn_go_cli_server(
+            &bind_addr,
+            &fixture.username,
+            &home_dir,
+            &cert_path,
+            &key_path,
+            &log_path,
+        )
+        .await;
+
+        let mut config = ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+
+        let client = connect_client(&config).await.unwrap();
+        let payload = b"udp forward rust to real go";
+        let echoed = timeout(
+            Duration::from_secs(20),
+            run_udp_forwarding_round_trip_on_client(&client, remote_addr, payload),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client.shutdown().await;
+
+        assert_eq!(echoed, payload.to_vec());
+
+        echo_task.abort();
+        let _ = server.kill().await;
+        let _ = server.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_udp_forwarding_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let private_key_path = fixture.private_key_path.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let (remote_addr, echo_task) = spawn_udp_echo_server().await;
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let local_port = reserve_udp_port();
+        let log_path = tempdir.path().join("go-client-forward.log");
+        let mut forwarder = spawn_go_cli_udp_forwarder(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &private_key_path,
+            local_port,
+            remote_addr,
+            &log_path,
+        )
+        .await;
+
+        let socket =
+            TokioUdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+        let forward_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_port));
+        let payload = b"udp forward real go to rust";
+        socket.send_to(payload, forward_addr).await.unwrap();
+
+        let mut echoed = vec![0; 1024];
+        let (n, source) = timeout(Duration::from_secs(10), socket.recv_from(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, forward_addr);
+        assert_eq!(&echoed[..n], payload);
+
+        let status = timeout(Duration::from_secs(15), forwarder.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let logs = fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(status.code(), Some(0), "logs:\n{logs}");
+        assert!(!logs.contains("could not forward"), "{logs}");
+        assert!(!logs.contains("could not dial"), "{logs}");
+        assert!(!logs.contains("an error was encountered"), "{logs}");
+
+        echo_task.abort();
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn exec_capture_round_trips_with_ed25519_agent_auth() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
@@ -3844,6 +4141,108 @@ mod tests {
         drop(session_runtime);
         client.shutdown().await;
         server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_forward_agent_round_trips_against_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
+        let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+
+        let bind_port = reserve_udp_port();
+        let bind_addr = format!("127.0.0.1:{bind_port}");
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+        let log_path = tempdir.path().join("go-server.log");
+
+        let mut server = spawn_go_cli_server(
+            &bind_addr,
+            &fixture.username,
+            &home_dir,
+            &cert_path,
+            &key_path,
+            &log_path,
+        )
+        .await;
+
+        let mut config = ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+        config.forward_agent = true;
+        config.agent_socket = Some(agent.socket_path.clone());
+
+        let client = connect_client(&config).await.unwrap();
+        let channel = client.open_session_channel().await.unwrap();
+        let request =
+            SessionRequest::Exec("printf '%s\\n' \"$SSH_AUTH_SOCK\"; sleep 2".to_string());
+        send_forward_agent_request(channel.as_ref()).await.unwrap();
+        let session_runtime =
+            build_session_runtime(&client, &config, channel.clone(), &request, None).unwrap();
+        send_initial_session_requests(channel.as_ref(), &request, None)
+            .await
+            .unwrap();
+
+        let socket_path = match timeout(Duration::from_secs(5), read_stdout_line(&channel)).await {
+            Ok(Ok(path)) => path,
+            Ok(Err(err)) => {
+                let logs = fs::read_to_string(&log_path).unwrap_or_default();
+                panic!(
+                    "failed to read forwarded SSH_AUTH_SOCK from real Go server: {err}\nlogs:\n{logs}"
+                );
+            }
+            Err(_) => {
+                let logs = fs::read_to_string(&log_path).unwrap_or_default();
+                panic!(
+                    "timed out reading forwarded SSH_AUTH_SOCK from real Go server\nlogs:\n{logs}"
+                );
+            }
+        };
+        assert!(!socket_path.is_empty());
+
+        let signature =
+            request_forwarded_agent_signature(&socket_path, b"real go server forwarded agent")
+                .await
+                .unwrap();
+        assert!(!signature.is_empty());
+        assert_eq!(agent.sign_flags(), vec![0]);
+
+        loop {
+            match channel.next_message().await.unwrap() {
+                Message::ChannelRequest(message) => match message.request {
+                    ChannelRequest::ExitStatus(status) => {
+                        assert_eq!(status.exit_status, 0);
+                        break;
+                    }
+                    ChannelRequest::ExitSignal(signal) => {
+                        panic!("unexpected exit signal: {signal:?}")
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        drop(session_runtime);
+        client.shutdown().await;
+        let _ = server.kill().await;
+        let _ = server.wait().await;
     }
 
     #[tokio::test]

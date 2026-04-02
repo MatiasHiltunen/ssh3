@@ -7,7 +7,7 @@ import (
 )
 
 func NewUnixSocketPath() (string, error) {
-	dir, err := os.MkdirTemp("/tmp/", "")
+	dir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return "", err
 	}
