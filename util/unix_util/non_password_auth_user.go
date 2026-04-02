@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"fmt"
+	"os"
 	osuser "os/user"
 
 	"github.com/rs/zerolog/log"
@@ -15,6 +16,34 @@ import (
 func getUser(username string) (*User, error) {
 	u, err := osuser.Lookup(username)
 	if err != nil {
+		if runtime.GOOS == "android" {
+			currentUsername := os.Getenv("USER")
+			if currentUsername == "" {
+				currentUsername = os.Getenv("LOGNAME")
+			}
+			if currentUsername == "" || currentUsername == username {
+				homeDir, homeErr := os.UserHomeDir()
+				if homeErr != nil || homeDir == "" {
+					homeDir = os.Getenv("HOME")
+				}
+				if homeDir == "" {
+					return nil, err
+				}
+
+				shell := os.Getenv("SHELL")
+				if shell == "" {
+					shell = "/bin/sh"
+				}
+
+				return &User{
+					Username: username,
+					Uid:      uint64(os.Getuid()),
+					Gid:      uint64(os.Getgid()),
+					Dir:      homeDir,
+					Shell:    shell,
+				}, nil
+			}
+		}
 		return nil, err
 	}
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -98,7 +99,9 @@ type runningSession struct {
 	channelState        channelType
 	pty                 *openPty
 	runningCmd          *runningCommand
+	runningCmdDone      chan struct{}
 	authAgentSocketPath string
+	closeInputOnce      sync.Once
 }
 
 // var runningSessions = make(map[ssh3.Channel]*runningSession)
@@ -249,21 +252,62 @@ func forwardTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net
 	}()
 }
 
-func execCmdInBackground(channel ssh3.Channel, openPty *openPty, user *unix_util.User, runningCommand *runningCommand, authAgentSocketPath string) error {
-	setupEnv(user, runningCommand, authAgentSocketPath)
+func closeRunningCommandInput(session *runningSession) {
+	if session == nil || session.runningCmd == nil || session.pty != nil {
+		return
+	}
+	stdinCloser, ok := session.runningCmd.stdinW.(io.Closer)
+	if !ok {
+		return
+	}
+	session.closeInputOnce.Do(func() {
+		if err := stdinCloser.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			log.Debug().Msgf("could not close stdin for running command: %s", err)
+		}
+	})
+}
+
+func waitForRunningCommandAfterInputEOF(ctx context.Context, channel ssh3.Channel, session *runningSession) {
+	if session == nil || session.channelState != OPEN || session.runningCmd == nil || session.pty != nil || session.runningCmdDone == nil {
+		return
+	}
+	closeRunningCommandInput(session)
+	log.Debug().Msgf("input closed on session channel %d, waiting for command completion", channel.ChannelID())
+	select {
+	case <-session.runningCmdDone:
+	case <-ctx.Done():
+	}
+}
+
+func execCmdInBackground(channel ssh3.Channel, user *unix_util.User, session *runningSession) error {
+	runningCommand := session.runningCmd
+	openPty := session.pty
+	log.Debug().Msgf(
+		"starting command for channel %d: path=%q args=%q pty=%t",
+		channel.ChannelID(),
+		runningCommand.Path,
+		runningCommand.Args,
+		openPty != nil,
+	)
+	setupEnv(user, runningCommand, session.authAgentSocketPath)
 	if openPty != nil {
 		err := unix_util.StartWithSizeAndPty(&runningCommand.Cmd, openPty.winSize, openPty.pty, openPty.tty)
 		if err != nil {
+			log.Debug().Msgf("failed to start PTY command on channel %d: %s", channel.ChannelID(), err)
 			return err
 		}
 	} else {
 		err := runningCommand.Start()
 		if err != nil {
+			log.Debug().Msgf("failed to start command on channel %d: %s", channel.ChannelID(), err)
 			return err
 		}
 	}
+	log.Debug().Msgf("started command for channel %d", channel.ChannelID())
 
+	done := session.runningCmdDone
 	go func() {
+		defer close(done)
 
 		type readResult struct {
 			data []byte
@@ -353,6 +397,7 @@ func execCmdInBackground(channel ssh3.Channel, openPty *openPty, user *unix_util
 					// disable the channel: a select on a nil is always blocking
 					execResultChan = nil
 				} else {
+					log.Debug().Msgf("command wait completed on channel %d with err=%v", channel.ChannelID(), err)
 					execExitStatus = uint64(0)
 					if err != nil {
 						if exitError, ok := err.(*exec.ExitError); ok {
@@ -362,6 +407,7 @@ func execCmdInBackground(channel ssh3.Channel, openPty *openPty, user *unix_util
 				}
 			}
 			if stdoutChan == nil && stderrChan == nil && execResultChan == nil {
+				log.Debug().Msgf("sending exit-status %d on channel %d", execExitStatus, channel.ChannelID())
 				err := channel.SendRequest(&ssh3Messages.ChannelRequestMessage{
 					WantReply:      false,
 					ChannelRequest: &ssh3Messages.ExitStatusRequest{ExitStatus: execExitStatus},
@@ -423,6 +469,14 @@ func newCommand(user *unix_util.User, channel ssh3.Channel, loginShell bool, com
 	if session.channelState != LARVAL {
 		return fmt.Errorf("cannot request new shell on already established session")
 	}
+	log.Debug().Msgf(
+		"preparing command for channel %d: login_shell=%t command=%q args=%q pty=%t",
+		channel.ChannelID(),
+		loginShell,
+		command,
+		args,
+		session.pty != nil,
+	)
 
 	env := ""
 	if session.pty != nil {
@@ -460,6 +514,7 @@ func newCommand(user *unix_util.User, channel ssh3.Channel, loginShell bool, com
 	}
 
 	if err != nil {
+		log.Debug().Msgf("failed to prepare command for channel %d: %s", channel.ChannelID(), err)
 		return err
 	}
 
@@ -471,10 +526,10 @@ func newCommand(user *unix_util.User, channel ssh3.Channel, loginShell bool, com
 	}
 
 	session.runningCmd = runningCommand
-
 	session.channelState = OPEN
+	session.runningCmdDone = make(chan struct{})
 
-	return execCmdInBackground(channel, session.pty, user, session.runningCmd, session.authAgentSocketPath)
+	return execCmdInBackground(channel, user, session)
 }
 
 func newShellReq(user *unix_util.User, channel ssh3.Channel, wantReply bool) error {
@@ -856,10 +911,13 @@ func ServerMain() int {
 
 			switch c := channel.(type) {
 			case *ssh3.UDPForwardingChannelImpl:
+				log.Debug().Msgf("accepted UDP forwarding channel %d to %s", channel.ChannelID(), c.RemoteAddr)
 				handleUDPForwardingChannel(conv.Context(), authenticatedUser, conv, c)
 			case *ssh3.TCPForwardingChannelImpl:
+				log.Debug().Msgf("accepted TCP forwarding channel %d to %s", channel.ChannelID(), c.RemoteAddr)
 				handleTCPForwardingChannel(conv.Context(), authenticatedUser, conv, c)
 			default:
+				log.Debug().Msgf("accepted session channel %d of type %q", channel.ChannelID(), channel.ChannelType())
 				runningSessions.Insert(channel, &runningSession{
 					channelState: LARVAL,
 					pty:          nil,
@@ -879,8 +937,15 @@ func ServerMain() int {
 							return
 						}
 						if genericMessage == nil {
+							if errors.Is(err, io.EOF) {
+								runningSession, ok := runningSessions.Get(channel)
+								if ok {
+									waitForRunningCommandAfterInputEOF(conv.Context(), channel, runningSession)
+								}
+							}
 							return
 						}
+						log.Debug().Msgf("received message of type %T on channel %d", genericMessage, channel.ChannelID())
 						switch message := genericMessage.(type) {
 						case *ssh3Messages.ChannelRequestMessage:
 							switch requestMessage := message.ChannelRequest.(type) {

@@ -3,6 +3,7 @@ package unix_util
 import (
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
@@ -33,7 +34,11 @@ func (u *User) CreateCommand(addEnv string, stdout, stderr io.Writer, stdin io.R
 	}
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{}
-	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(u.Uid), Gid: uint32(u.Gid)}
+	currentUID := uint64(os.Getuid())
+	currentGID := uint64(os.Getgid())
+	if u.Uid != currentUID || u.Gid != currentGID {
+		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(u.Uid), Gid: uint32(u.Gid)}
+	}
 
 	var err error
 	var stdoutR, stderrR io.Reader
@@ -74,7 +79,11 @@ func (u *User) CreateCommandPipeOutput(addEnv string, loginShell bool, command s
 	cmd.Dir = u.Dir
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{}
-	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(u.Uid), Gid: uint32(u.Gid)}
+	currentUID := uint64(os.Getuid())
+	currentGID := uint64(os.Getgid())
+	if u.Uid != currentUID || u.Gid != currentGID {
+		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(u.Uid), Gid: uint32(u.Gid)}
+	}
 
 	return u.CreateCommand(addEnv, nil, nil, nil, loginShell, command, args...)
 }

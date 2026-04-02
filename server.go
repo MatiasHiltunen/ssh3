@@ -65,6 +65,12 @@ func NewServer(maxPacketSize uint64, defaultDatagramQueueSize uint64, h3Server *
 			log.Error().Msgf("%s", err)
 			return false, err
 		}
+		log.Debug().Msgf(
+			"accepted SSH3 channel %d of type %q for control stream %d",
+			uint64(stream.StreamID()),
+			channelType,
+			conversationControlStreamID,
+		)
 
 		channelInfo := &ChannelInfo{
 			ConversationID:       conversation.conversationID,
@@ -130,7 +136,10 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 
 	return func(authenticatedUsername string, newConv *Conversation, w http.ResponseWriter, r *http.Request) {
 		log.Info().Msgf("got request: method: %s, URL: %s", r.Method, r.URL.String())
-		if r.Method == http.MethodConnect && r.Proto == "ssh3" {
+		if r.Method == http.MethodConnect {
+			if r.Proto != "ssh3" {
+				log.Debug().Msgf("accepting CONNECT request with proto %q as SSH3", r.Proto)
+			}
 			hijacker, ok := w.(http3.Hijacker)
 			if !ok { // should never happen, unless quic-go change their API
 				log.Error().Msg("failed to hijack HTTP conversation: is it an HTTP/3 conversation ?")
@@ -142,6 +151,11 @@ func (s *Server) GetHTTPHandlerFunc(ctx context.Context) AuthenticatedHandlerFun
 			conversationsManager.addConversation(newConv)
 
 			w.WriteHeader(200)
+			log.Debug().Msgf(
+				"accepted SSH3 CONNECT for user %s on control stream %d",
+				authenticatedUsername,
+				newConv.controlStream.StreamID(),
+			)
 
 			go func() {
 				// TODO: this hijacks the datagrams for the whole quic connection, so the server
