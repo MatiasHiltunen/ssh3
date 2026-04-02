@@ -1609,6 +1609,11 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct GoAgentProbeBinary {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
     struct GoCliBinaries {
         client: PathBuf,
         server: PathBuf,
@@ -1703,6 +1708,18 @@ mod tests {
             build_go_binary("./cmd/ssh3", &client);
             build_go_binary("./cmd/ssh3-server", &server);
             GoCliBinaries { client, server }
+        })
+    }
+
+    #[cfg(unix)]
+    fn go_agent_probe_binary() -> &'static GoAgentProbeBinary {
+        static BINARY: OnceLock<GoAgentProbeBinary> = OnceLock::new();
+        BINARY.get_or_init(|| {
+            let dir = repo_root().join("target/go-interop");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("ssh3-agent-probe");
+            build_go_binary("./internal/interop/agent_probe", &path);
+            GoAgentProbeBinary { path }
         })
     }
 
@@ -2043,6 +2060,71 @@ mod tests {
         .await
         .unwrap()
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn run_go_cli_client_with_forwarded_agent(
+        home_dir: &Path,
+        url: &str,
+        private_key_path: &Path,
+        agent_socket: &Path,
+        command: &[&str],
+    ) -> std::process::Output {
+        let binaries = go_cli_binaries();
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+        let mut child = TokioCommand::new(&binaries.client)
+            .arg("-v")
+            .arg("-insecure")
+            .arg("-privkey")
+            .arg(private_key_path)
+            .arg("-forward-agent")
+            .arg(url)
+            .args(command)
+            .env("HOME", home_dir)
+            .env("SSH_AUTH_SOCK", agent_socket)
+            .env("SSH3_SKIP_AUTH_AGENT_INIT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut stdout = child.stdout.take().unwrap();
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stdout.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stderr.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        match timeout(Duration::from_secs(30), child.wait()).await {
+            Ok(status) => std::process::Output {
+                status: status.unwrap(),
+                stdout: stdout_task.await.unwrap(),
+                stderr: stderr_task.await.unwrap(),
+            },
+            Err(_) => {
+                let _ = child.kill().await;
+                let status = child.wait().await.unwrap();
+                let output = std::process::Output {
+                    status,
+                    stdout: stdout_task.await.unwrap(),
+                    stderr: stderr_task.await.unwrap(),
+                };
+                panic!(
+                    "go client with forwarded agent timed out\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -4243,6 +4325,100 @@ mod tests {
         client.shutdown().await;
         let _ = server.kill().await;
         let _ = server.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_agent_probe_talks_to_mock_agent_locally() {
+        let _guard = lock_go_binary_tests();
+        let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
+        let probe = go_agent_probe_binary();
+
+        let output = timeout(
+            Duration::from_secs(10),
+            TokioCommand::new(&probe.path)
+                .env("SSH_AUTH_SOCK", agent.socket_path.as_path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("SSH3_AGENT_PROBE_OK 1 ssh-ed25519"),
+            "{stdout}"
+        );
+        assert_eq!(agent.sign_flags(), vec![0]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_forward_agent_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
+        let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
+        let probe = go_agent_probe_binary();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let private_key_path = fixture.private_key_path.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let output = run_go_cli_client_with_forwarded_agent(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &private_key_path,
+            agent.socket_path.as_path(),
+            &[probe.path.to_string_lossy().as_ref()],
+        )
+        .await;
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("SSH3_AGENT_PROBE_OK 1 ssh-ed25519"),
+            "{stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("agent forwarding error"), "{output:?}");
+        assert!(!stderr.contains("could not establish"), "{output:?}");
+        assert!(!stderr.contains("an error was encountered"), "{output:?}");
+        assert_eq!(agent.sign_flags(), vec![0]);
+
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
     }
 
     #[tokio::test]

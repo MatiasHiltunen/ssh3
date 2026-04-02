@@ -268,6 +268,37 @@ impl Channel {
         self.confirm_received.load(Ordering::SeqCst)
     }
 
+    pub async fn wait_for_confirmation(&self) -> Result<(), ChannelError> {
+        if self.confirm_received() {
+            return Ok(());
+        }
+
+        loop {
+            let message = {
+                let mut recv = self.recv.lock().await;
+                parse_message(recv.as_mut()).await?
+            };
+
+            match message {
+                Message::ChannelOpenConfirmation(_) => {
+                    self.confirm_received.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Message::ChannelOpenFailure(message) => {
+                    return Err(ChannelError::OpenFailure(ChannelOpenFailure {
+                        reason_code: message.reason_code,
+                        error_message_utf8: message.error_message_utf8,
+                    }));
+                }
+                other => {
+                    return Err(ChannelError::NonConfirmed(MessageOnNonConfirmedChannel {
+                        message: other,
+                    }));
+                }
+            }
+        }
+    }
+
     pub async fn next_message(&self) -> Result<Message, ChannelError> {
         loop {
             let message = {

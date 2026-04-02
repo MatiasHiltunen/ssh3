@@ -1510,6 +1510,8 @@ async fn handle_agent_socket_conn(
         default_datagrams_queue_size,
     )
     .await?;
+    channel.maybe_send_header().await?;
+    channel.wait_for_confirmation().await?;
     let (mut reader, mut writer) = stream.into_split();
 
     let mut to_socket = tokio::spawn({
