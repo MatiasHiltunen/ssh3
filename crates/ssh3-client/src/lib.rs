@@ -24,7 +24,8 @@ use ssh3_auth::{AuthError, bearer_authorization_value, build_bearer_token, load_
 use ssh3_core::{Channel, ChannelError, Conversation};
 use ssh3_h3::{
     BuildConnectRequestError, ClientControlStream, ClientConversationError, ConversationIdError,
-    SSH3_USER_HEADER, SendRequest, generate_conversation_id, new_client, response_server_header,
+    SSH3_USER_HEADER, SSH3_VERSION_STRING, SendRequest, generate_conversation_id, new_client,
+    response_server_header,
 };
 use ssh3_proto::{
     ChannelRequest, ChannelRequestMessage, ExecRequest, ExitSignalRequest, Message, PtyRequest,
@@ -47,7 +48,7 @@ mod agent;
 pub use agent::AgentSelection;
 use agent::{build_agent_bearer_token, resolve_agent_socket_path};
 
-const DEFAULT_USER_AGENT: &str = "SSH 3.0 rust-client";
+const DEFAULT_USER_AGENT: &str = SSH3_VERSION_STRING;
 const DEFAULT_OIDC_SCOPE: &str = "openid email";
 const OIDC_CALLBACK_PATH: &str = "/ssh";
 
@@ -1451,10 +1452,12 @@ async fn forward_agent_channel(
 mod tests {
     use std::fs;
     use std::io;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     #[cfg(unix)]
-    use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::process::{Command as StdCommand, Stdio};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use base64::Engine as _;
@@ -1474,17 +1477,20 @@ mod tests {
     use ssh_key::{Algorithm, HashAlg, Signature};
     use ssh3_core::Channel;
     use ssh3_h3::{
-        accept_server_conversation, is_ssh3_connect, new_server, response_with_server_header,
+        SSH3_VERSION_STRING, accept_server_conversation, is_ssh3_connect, new_server,
+        response_with_server_header,
     };
     use ssh3_proto::{ChannelRequest, Message, SSH_EXTENDED_DATA_NONE};
     use ssh3_quinn::accept_bi_channel;
     use ssh3_quinn::self_signed_server_config;
     use ssh3_server::{ServerConfig, serve_connection};
     use tempfile::TempDir;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     #[cfg(unix)]
     use tokio::net::{UnixListener, UnixStream};
+    #[cfg(unix)]
+    use tokio::process::Command as TokioCommand;
     use tokio::time::timeout;
     use url::Url;
 
@@ -1529,7 +1535,7 @@ mod tests {
             accepted
                 .control_stream
                 .send_response(
-                    response_with_server_header(StatusCode::OK, "SSH 3.0 rust-server").unwrap(),
+                    response_with_server_header(StatusCode::OK, SSH3_VERSION_STRING).unwrap(),
                 )
                 .await
                 .unwrap();
@@ -1571,6 +1577,12 @@ mod tests {
         User::from_uid(Uid::current()).unwrap().unwrap().name
     }
 
+    #[cfg(unix)]
+    struct GoInteropBinaries {
+        client: PathBuf,
+        server: PathBuf,
+    }
+
     struct AuthFixture {
         _tempdir: TempDir,
         private_key_path: std::path::PathBuf,
@@ -1602,6 +1614,130 @@ mod tests {
                 ssh_key::PrivateKey::from(RsaKeypair::try_from(&rsa_private_key).unwrap())
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn build_go_binary(package: &str, output_path: &Path) {
+        let build_output = StdCommand::new("go")
+            .arg("build")
+            .arg("-mod=mod")
+            .arg("-tags")
+            .arg("disable_password_auth")
+            .arg("-o")
+            .arg(output_path)
+            .arg(package)
+            .current_dir(repo_root())
+            .output()
+            .unwrap();
+        if !build_output.status.success() {
+            panic!(
+                "go build {} failed\nstdout:\n{}\nstderr:\n{}",
+                package,
+                String::from_utf8_lossy(&build_output.stdout),
+                String::from_utf8_lossy(&build_output.stderr),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn go_interop_binaries() -> &'static GoInteropBinaries {
+        static BINARIES: OnceLock<GoInteropBinaries> = OnceLock::new();
+        BINARIES.get_or_init(|| {
+            let dir = repo_root().join("target/go-interop");
+            fs::create_dir_all(&dir).unwrap();
+            let client = dir.join("ssh3-go-interop-client");
+            let server = dir.join("ssh3-go-interop-server");
+            build_go_binary("./internal/interop/go_client", &client);
+            build_go_binary("./internal/interop/go_server", &server);
+            GoInteropBinaries { client, server }
+        })
+    }
+
+    #[cfg(unix)]
+    async fn spawn_go_interop_server(
+        bind_addr: &str,
+        username: &str,
+        authorized_identity_path: &Path,
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> (tokio::process::Child, SocketAddr) {
+        let binaries = go_interop_binaries();
+        let mut child = TokioCommand::new(&binaries.server)
+            .arg("--bind")
+            .arg(bind_addr)
+            .arg("--url-path")
+            .arg("/ssh3-term")
+            .arg("--user")
+            .arg(username)
+            .arg("--authorized-identity")
+            .arg(authorized_identity_path)
+            .arg("--cert")
+            .arg(cert_path)
+            .arg("--key")
+            .arg(key_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut ready_line = String::new();
+        let bytes_read = timeout(Duration::from_secs(10), reader.read_line(&mut ready_line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            bytes_read > 0,
+            "go interop server exited before signaling readiness"
+        );
+        let ready_line = ready_line.trim();
+        let (_, bind_addr) = ready_line
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("unexpected go interop server readiness line: {ready_line}"));
+        let bind_addr = bind_addr.parse::<SocketAddr>().unwrap_or_else(|err| {
+            panic!("invalid go interop server bind address {bind_addr}: {err}")
+        });
+        drop(reader);
+        (child, bind_addr)
+    }
+
+    #[cfg(unix)]
+    async fn run_go_interop_client(
+        url: &str,
+        username: &str,
+        private_key_path: &Path,
+        command: &str,
+    ) -> std::process::Output {
+        let binaries = go_interop_binaries();
+        timeout(
+            Duration::from_secs(20),
+            TokioCommand::new(&binaries.client)
+                .arg("--url")
+                .arg(url)
+                .arg("--user")
+                .arg(username)
+                .arg("--privkey")
+                .arg(private_key_path)
+                .arg("--insecure")
+                .arg(command)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 
     fn create_auth_fixture(algorithm: AuthKeyAlgorithm) -> AuthFixture {
@@ -2336,7 +2472,7 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"hello from client\n".to_vec(),
                 stderr: Vec::new(),
@@ -2344,6 +2480,54 @@ mod tests {
         );
 
         server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_exec_capture_round_trips_against_the_go_server() {
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+
+        let (mut server, bind_addr) = spawn_go_interop_server(
+            "127.0.0.1:0",
+            &fixture.username,
+            &fixture.authorized_identities_path,
+            &cert_path,
+            &key_path,
+        )
+        .await;
+
+        let mut config = ClientConfig::new(
+            format!("https://127.0.0.1:{}/ssh3-term", bind_addr.port())
+                .parse()
+                .unwrap(),
+        );
+        config.trust = TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+
+        let session = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_exec_capture(&config, "printf 'hello from rust to go\\n'"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(session.exit_status, 0);
+        assert_eq!(session.stdout, b"hello from rust to go\n".to_vec());
+        assert!(session.stderr.is_empty());
+        assert!(
+            session
+                .server_header
+                .as_deref()
+                .is_some_and(|value| value.starts_with("SSH "))
+        );
+
+        let _ = server.kill().await;
+        let _ = server.wait().await;
     }
 
     #[tokio::test]
@@ -2403,7 +2587,7 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated client\n".to_vec(),
                 stderr: Vec::new(),
@@ -2470,7 +2654,7 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via p256\n".to_vec(),
                 stderr: Vec::new(),
@@ -2537,12 +2721,67 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via rsa\n".to_vec(),
                 stderr: Vec::new(),
             }
         );
+
+        server_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_client_exec_round_trips_against_the_rust_server() {
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let private_key_path = fixture.private_key_path.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                serve_connection(connection, config),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        });
+
+        let output = run_go_interop_client(
+            &format!("https://localhost:{}/ssh3-term", server_addr.port()),
+            &username,
+            &private_key_path,
+            "printf 'hello from go to rust\\n'",
+        )
+        .await;
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"hello from go to rust\n".to_vec());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("go interop client failed"), "{output:?}");
+        assert!(!stderr.contains("could not establish"), "{output:?}");
 
         server_task.await.unwrap();
     }
@@ -2607,7 +2846,7 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via agent\n".to_vec(),
                 stderr: Vec::new(),
@@ -2679,7 +2918,7 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via rsa agent\n".to_vec(),
                 stderr: Vec::new(),
@@ -2922,7 +3161,7 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via oidc\n".to_vec(),
                 stderr: Vec::new(),
@@ -2999,7 +3238,7 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via oidc login\n".to_vec(),
                 stderr: Vec::new(),
@@ -3079,7 +3318,7 @@ mod tests {
         assert_eq!(
             session,
             CapturedSession {
-                server_header: Some("SSH 3.0 rust-server".to_string()),
+                server_header: Some(SSH3_VERSION_STRING.to_string()),
                 exit_status: 0,
                 stdout: b"authenticated via password\n".to_vec(),
                 stderr: Vec::new(),

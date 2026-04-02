@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use quinn::{
     ClientConfig, ServerConfig,
-    crypto::rustls::{NoInitialCipherSuite, QuicClientConfig},
+    crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig},
 };
 use rcgen::CertifiedKey;
 use rustls::{
     RootCertStore,
     client::VerifierBuilderError,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
 };
 
@@ -67,15 +68,35 @@ impl From<NoInitialCipherSuite> for ConfigError {
     }
 }
 
+const H3_ALPN: &[u8] = b"h3";
+
+fn tls_provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
 pub fn server_config_with_single_cert(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig, ConfigError> {
-    Ok(ServerConfig::with_single_cert(cert_chain, key)?)
+    let mut server_crypto = rustls::ServerConfig::builder_with_provider(tls_provider())
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)?;
+    server_crypto.alpn_protocols = vec![H3_ALPN.to_vec()];
+    Ok(ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(server_crypto)?,
+    )))
 }
 
 pub fn client_config_with_roots(roots: RootCertStore) -> Result<ClientConfig, ConfigError> {
-    Ok(ClientConfig::with_root_certificates(Arc::new(roots))?)
+    let mut client_crypto = rustls::ClientConfig::builder_with_provider(tls_provider())
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![H3_ALPN.to_vec()];
+    Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
+        client_crypto,
+    )?)))
 }
 
 pub fn client_config_for_certificate(
@@ -92,10 +113,12 @@ pub fn client_config_with_webpki_roots() -> Result<ClientConfig, ConfigError> {
 }
 
 pub fn client_config_insecure() -> Result<ClientConfig, ConfigError> {
-    let client_config = rustls::ClientConfig::builder()
+    let mut client_config = rustls::ClientConfig::builder_with_provider(tls_provider())
+        .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
+    client_config.alpn_protocols = vec![H3_ALPN.to_vec()];
     Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
         client_config,
     )?)))

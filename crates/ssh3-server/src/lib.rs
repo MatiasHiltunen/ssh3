@@ -33,8 +33,8 @@ use ssh3_auth::{
 use ssh3_core::{AcceptedChannel, Channel, ChannelError, ConversationError};
 use ssh3_h3::{
     AcceptedServerConversation, BuildConnectRequestError, DatagramDispatchError, SSH3_USER_HEADER,
-    ServerConnectionDriver, ServerConversationError, is_ssh3_connect, response_with_server_header,
-    route_registered_datagram,
+    SSH3_VERSION_STRING, ServerConnectionDriver, ServerConversationError, is_ssh3_connect,
+    response_with_server_header, route_registered_datagram,
 };
 use ssh3_proto::{
     ChannelRequest, ChannelRequestMessage, ExitStatusRequest, Message, PtyRequest,
@@ -97,7 +97,7 @@ impl Default for ServerConfig {
         Self {
             bind_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4433)),
             cert_subject_alt_names: vec!["localhost".to_string()],
-            server_header: "SSH 3.0 rust-server".to_string(),
+            server_header: SSH3_VERSION_STRING.to_string(),
             max_packet_size: 30_000,
             default_datagrams_queue_size: 10,
             require_authentication: false,
@@ -1356,7 +1356,6 @@ async fn spawn_pipe_session_process(
                 request: ChannelRequest::ExitStatus(ExitStatusRequest { exit_status }),
             })
             .await;
-        let _ = channel.close().await;
     });
 
     Ok(RunningSession {
@@ -1442,7 +1441,6 @@ async fn spawn_pty_session_process(
                 request: ChannelRequest::ExitStatus(ExitStatusRequest { exit_status }),
             })
             .await;
-        let _ = channel.close().await;
     });
 
     Ok(RunningSession {
@@ -1924,8 +1922,9 @@ mod tests {
     use ssh3_auth::build_bearer_token;
     use ssh3_core::{Channel, Conversation};
     use ssh3_h3::{
-        ClientControlStream, ClientConversationError, SSH3_USER_HEADER, SendRequest,
-        build_connect_request, establish_client_conversation, generate_conversation_id, new_client,
+        ClientControlStream, ClientConversationError, SSH3_USER_HEADER, SSH3_VERSION_STRING,
+        SendRequest, build_connect_request, establish_client_conversation,
+        generate_conversation_id, new_client,
     };
     use ssh3_proto::{
         ChannelRequest, ChannelRequestMessage, ExecRequest, ExitStatusRequest, Message, PtyRequest,
@@ -2030,7 +2029,7 @@ mod tests {
         });
         let mut request = build_connect_request(
             "https://localhost/ssh3-term".parse().unwrap(),
-            "SSH 3.0 rust-client",
+            SSH3_VERSION_STRING,
         )
         .unwrap();
         if let Some(requested_user) = requested_user {
@@ -2138,7 +2137,7 @@ mod tests {
         let conversation_id = generate_conversation_id(&client_connection).unwrap();
         let mut request = build_connect_request(
             "https://localhost/ssh3-term".parse().unwrap(),
-            "SSH 3.0 rust-client",
+            SSH3_VERSION_STRING,
         )
         .unwrap();
         request.headers_mut().insert(
@@ -2831,7 +2830,7 @@ mod tests {
 
         let request = build_connect_request(
             "https://localhost/ssh3-term".parse().unwrap(),
-            "SSH 3.0 rust-client",
+            SSH3_VERSION_STRING,
         )
         .unwrap();
         let mut stream = send_request.send_request(request).await.unwrap();

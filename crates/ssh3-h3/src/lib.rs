@@ -14,6 +14,7 @@ pub const SSH3_PROTOCOL_NAME: &str = "ssh3";
 pub const SSH3_EXPORTER_LABEL: &[u8] = b"EXPORTER-SSH3";
 pub const SSH3_CONVERSATION_ID_LEN: usize = 32;
 pub const SSH3_USER_HEADER: &str = "x-ssh3-user";
+pub const SSH3_VERSION_STRING: &str = "SSH 3.0 ssh3-rust 0.1.0 experimental_spec_version=alpha-00";
 
 pub type QuinnConnection = h3_quinn::Connection;
 pub type ClientConnection = h3::client::Connection<QuinnConnection, Bytes>;
@@ -524,17 +525,17 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        SSH3_PROTOCOL_NAME, ServerConnectionDriver, accept_server_conversation,
-        build_connect_request, establish_client_conversation, is_ssh3_connect, new_client,
-        new_server, request_protocol, request_user_agent, response_server_header,
-        response_with_server_header,
+        SSH3_PROTOCOL_NAME, SSH3_VERSION_STRING, ServerConnectionDriver,
+        accept_server_conversation, build_connect_request, establish_client_conversation,
+        is_ssh3_connect, new_client, new_server, request_protocol, request_user_agent,
+        response_server_header, response_with_server_header,
     };
 
     #[test]
     fn build_connect_request_sets_ssh3_protocol_and_user_agent() {
         let request = build_connect_request(
             "https://localhost/ssh3-term".parse().unwrap(),
-            "SSH 3.0 rust-client",
+            SSH3_VERSION_STRING,
         )
         .unwrap();
 
@@ -543,7 +544,7 @@ mod tests {
             request_protocol(&request).map(|protocol| protocol.as_str()),
             Some(SSH3_PROTOCOL_NAME)
         );
-        assert_eq!(request_user_agent(&request), Some("SSH 3.0 rust-client"));
+        assert_eq!(request_user_agent(&request), Some(SSH3_VERSION_STRING));
     }
 
     #[tokio::test]
@@ -588,7 +589,7 @@ mod tests {
             assert_eq!(accepted.request.version(), Version::HTTP_3);
             assert_eq!(
                 request_user_agent(&accepted.request),
-                Some("SSH 3.0 rust-client")
+                Some(SSH3_VERSION_STRING)
             );
             assert_eq!(
                 request_protocol(&accepted.request).map(|protocol| protocol.as_str()),
@@ -602,7 +603,7 @@ mod tests {
             accepted
                 .control_stream
                 .send_response(
-                    response_with_server_header(StatusCode::OK, "SSH 3.0 rust-server").unwrap(),
+                    response_with_server_header(StatusCode::OK, SSH3_VERSION_STRING).unwrap(),
                 )
                 .await
                 .unwrap();
@@ -622,7 +623,7 @@ mod tests {
                     client_quinn,
                     build_connect_request(
                         "https://localhost/ssh3-term?user=tester".parse().unwrap(),
-                        "SSH 3.0 rust-client",
+                        SSH3_VERSION_STRING,
                     )
                     .unwrap(),
                     30_000,
@@ -644,7 +645,7 @@ mod tests {
             );
             assert_eq!(
                 response_server_header(&established.response),
-                Some("SSH 3.0 rust-server")
+                Some(SSH3_VERSION_STRING)
             );
 
             let _ = response_seen_tx.send(());
@@ -699,7 +700,7 @@ mod tests {
             accepted
                 .control_stream
                 .send_response(
-                    response_with_server_header(StatusCode::OK, "SSH 3.0 rust-server").unwrap(),
+                    response_with_server_header(StatusCode::OK, SSH3_VERSION_STRING).unwrap(),
                 )
                 .await
                 .unwrap();
@@ -750,7 +751,7 @@ mod tests {
                     client_quinn.clone(),
                     build_connect_request(
                         "https://localhost/ssh3-term?user=tester".parse().unwrap(),
-                        "SSH 3.0 rust-client",
+                        SSH3_VERSION_STRING,
                     )
                     .unwrap(),
                     30_000,
@@ -836,7 +837,7 @@ mod tests {
             accepted
                 .control_stream
                 .send_response(
-                    response_with_server_header(StatusCode::OK, "SSH 3.0 rust-server").unwrap(),
+                    response_with_server_header(StatusCode::OK, SSH3_VERSION_STRING).unwrap(),
                 )
                 .await
                 .unwrap();
@@ -899,7 +900,7 @@ mod tests {
                     client_quinn.clone(),
                     build_connect_request(
                         "https://localhost/ssh3-term?user=tester".parse().unwrap(),
-                        "SSH 3.0 rust-client",
+                        SSH3_VERSION_STRING,
                     )
                     .unwrap(),
                     30_000,
