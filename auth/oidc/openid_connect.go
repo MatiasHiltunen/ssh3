@@ -28,7 +28,7 @@ type OIDCConfig struct {
  *  started at a random port to retrieve the issued authorization token.
  *	This token is then returned as an http url-encoded string.
  */
-func Connect(ctx context.Context, oidcConfig *OIDCConfig, issuerURL string, doPKCE bool) (rawIDTokey string, err error) {
+func Connect(ctx context.Context, oidcConfig *OIDCConfig, issuerURL string, doPKCE bool, expectedNonce string) (rawIDTokey string, err error) {
 	provider, err := oidc.NewProvider(ctx, issuerURL)
 	if err != nil {
 		return "", err
@@ -59,17 +59,18 @@ func Connect(ctx context.Context, oidcConfig *OIDCConfig, issuerURL string, doPK
 		Scopes: []string{"openid email"},
 	}
 
-	challengeVerifierBytes := [64]byte{}
-	_, err = rand.Read(challengeVerifierBytes[:])
+	stateBytes := [32]byte{}
+	_, err = rand.Read(stateBytes[:])
 	if err != nil {
-		return "", fmt.Errorf("error when generating random verifier: %s", err.Error())
+		return "", fmt.Errorf("error when generating random state: %s", err.Error())
 	}
+	state := oidcVerifier(stateBytes[:])
 
 	verifier := oauth2.GenerateVerifier()
 
 	tokenChannel := make(chan string)
 	mux := http.NewServeMux()
-	mux.Handle(path, getOAuth2Callback(ctx, provider, oidcConfig.ClientID, &oauthConfig, tokenChannel, verifier, doPKCE))
+	mux.Handle(path, getOAuth2Callback(ctx, provider, oidcConfig.ClientID, &oauthConfig, tokenChannel, verifier, state, expectedNonce, doPKCE))
 	server := http.Server{Handler: mux}
 	go server.Serve(listener)
 	var cmd string
@@ -88,8 +89,11 @@ func Connect(ctx context.Context, oidcConfig *OIDCConfig, issuerURL string, doPK
 	if doPKCE {
 		options = append(options, oauth2.S256ChallengeOption(verifier))
 	}
+	if expectedNonce != "" {
+		options = append(options, oidc.Nonce(expectedNonce))
+	}
 
-	authCodeURL := oauthConfig.AuthCodeURL("state", options...)
+	authCodeURL := oauthConfig.AuthCodeURL(state, options...)
 
 	args = append(args, authCodeURL)
 	log.Debug().Msgf("spawning browser at %s\n", authCodeURL)
@@ -107,13 +111,18 @@ func Connect(ctx context.Context, oidcConfig *OIDCConfig, issuerURL string, doPK
 }
 
 func getOAuth2Callback(ctx context.Context, provider *oidc.Provider, clientID string, oauth2Config *oauth2.Config,
-	tokenChannel chan string, challengeVerifier string, doPKCE bool) http.HandlerFunc {
+	tokenChannel chan string, challengeVerifier string, expectedState string, expectedNonce string, doPKCE bool) http.HandlerFunc {
 
 	verifier := provider.Verifier(&oidc.Config{ClientID: clientID})
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer w.(http.Flusher).Flush()
 		// Verify state and errors.
+		if r.URL.Query().Get("state") != expectedState {
+			http.Error(w, "OIDC state mismatch", http.StatusBadRequest)
+			log.Error().Msg("error when verifying oauth token: state mismatch")
+			return
+		}
 
 		options := []oauth2.AuthCodeOption{}
 		if doPKCE {
@@ -143,9 +152,14 @@ func getOAuth2Callback(ctx context.Context, provider *oidc.Provider, clientID st
 		var claims struct {
 			Email    string `json:"email"`
 			Verified bool   `json:"email_verified"`
+			Nonce    string `json:"nonce"`
 		}
 		if err := idToken.Claims(&claims); err != nil {
 			log.Error().Msgf("error when parsing the oauth token claims: %s", err.Error())
+			return
+		}
+		if expectedNonce != "" && claims.Nonce != expectedNonce {
+			log.Error().Msgf("error when verifying oauth token claims: nonce mismatch")
 			return
 		}
 
@@ -154,7 +168,7 @@ func getOAuth2Callback(ctx context.Context, provider *oidc.Provider, clientID st
 	}
 }
 
-func VerifyRawToken(ctx context.Context, clientID string, issuerURL string, rawIDToken string) (*oidc.IDToken, error) {
+func VerifyRawToken(ctx context.Context, clientID string, issuerURL string, rawIDToken string, expectedNonce string) (*oidc.IDToken, error) {
 	provider, err := oidc.NewProvider(ctx, issuerURL)
 	if err != nil {
 		return nil, err
@@ -163,7 +177,25 @@ func VerifyRawToken(ctx context.Context, clientID string, issuerURL string, rawI
 	verifier := provider.Verifier(&oidc.Config{ClientID: clientID})
 	// Parse and verify ID Token payload.
 	idToken, err := verifier.Verify(ctx, rawIDToken)
-	// TODO: nonce validation ? Is id needed here ?
+	if err != nil {
+		return nil, err
+	}
 
-	return idToken, err
+	if expectedNonce != "" {
+		var claims struct {
+			Nonce string `json:"nonce"`
+		}
+		if err := idToken.Claims(&claims); err != nil {
+			return nil, err
+		}
+		if claims.Nonce != expectedNonce {
+			return nil, fmt.Errorf("OIDC nonce mismatch")
+		}
+	}
+
+	return idToken, nil
+}
+
+func oidcVerifier(randomBytes []byte) string {
+	return fmt.Sprintf("%x", randomBytes)
 }

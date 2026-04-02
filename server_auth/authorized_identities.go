@@ -39,7 +39,7 @@ func (i *OpenIDConnectIdentity) Verify(genericCandidate interface{}, base64Conve
 	log.Debug().Msgf("verifying openid connect idenitity")
 	switch candidate := genericCandidate.(type) {
 	case util.JWTTokenString:
-		token, err := oidc.VerifyRawToken(context.Background(), i.clientID, i.issuerURL, candidate.Token)
+		token, err := oidc.VerifyRawToken(context.Background(), i.clientID, i.issuerURL, candidate.Token, base64ConversationID)
 		if err != nil {
 			log.Error().Msgf("cannot verify raw token: %s", err.Error())
 			return false

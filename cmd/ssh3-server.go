@@ -546,7 +546,29 @@ func newSubsystemReq(user *unix_util.User, channel ssh3.Channel, request ssh3Mes
 }
 
 func newWindowChangeReq(user *unix_util.User, channel ssh3.Channel, request ssh3Messages.WindowChangeRequest, wantReply bool) error {
-	return fmt.Errorf("%T not implemented", request)
+	runningSession, ok := runningSessions.Get(channel)
+	if !ok {
+		return fmt.Errorf("could not find running session for channel %d (conv %d)", channel.ChannelID(), channel.ConversationID())
+	}
+
+	if runningSession.pty == nil {
+		return fmt.Errorf("cannot change window size without a requested pty on channel %d (conv %d)", channel.ChannelID(), channel.ConversationID())
+	}
+
+	runningSession.pty.winSize = &pty.Winsize{
+		Rows: uint16(request.CharHeight),
+		Cols: uint16(request.CharWidth),
+		X:    uint16(request.PixelWidth),
+		Y:    uint16(request.PixelHeight),
+	}
+	setWinsize(
+		runningSession.pty.pty,
+		request.CharWidth,
+		request.CharHeight,
+		request.PixelWidth,
+		request.PixelHeight,
+	)
+	return nil
 }
 
 func newSignalReq(user *unix_util.User, channel ssh3.Channel, request ssh3Messages.SignalRequest, wantReply bool) error {

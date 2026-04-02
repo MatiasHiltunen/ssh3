@@ -20,12 +20,15 @@ use reqwest::StatusCode as HttpStatusCode;
 use rustls::{RootCertStore, pki_types::CertificateDer};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use ssh3_auth::{AuthError, bearer_authorization_value, build_bearer_token, load_private_key};
+use ssh3_auth::{
+    AuthError, bearer_authorization_value, build_bearer_token, conversation_id_base64,
+    load_private_key,
+};
 use ssh3_core::{Channel, ChannelError, Conversation};
 use ssh3_h3::{
     BuildConnectRequestError, ClientControlStream, ClientConversationError, ConversationIdError,
-    SSH3_USER_HEADER, SSH3_VERSION_STRING, SendRequest, generate_conversation_id, new_client,
-    response_server_header,
+    EstablishedClientConversation, SSH3_USER_HEADER, SSH3_VERSION_STRING, SendRequest,
+    generate_conversation_id, new_client, response_server_header,
 };
 use ssh3_proto::{
     ChannelRequest, ChannelRequestMessage, ExecRequest, ExitSignalRequest, Message, PtyRequest,
@@ -912,6 +915,7 @@ async fn exchange_oidc_code(
 
 async fn authenticate_oidc_with_browser_opener(
     oidc: &OidcConfig,
+    expected_nonce: &str,
     browser_opener: fn(String) -> Result<(), OidcError>,
 ) -> Result<String, OidcError> {
     let discovery = fetch_oidc_discovery_document(&oidc.issuer_url).await?;
@@ -930,6 +934,7 @@ async fn authenticate_oidc_with_browser_opener(
         query.append_pair("redirect_uri", &redirect_uri);
         query.append_pair("scope", DEFAULT_OIDC_SCOPE);
         query.append_pair("state", &state);
+        query.append_pair("nonce", expected_nonce);
         if let Some(code_verifier) = code_verifier.as_deref() {
             query.append_pair("code_challenge", &oidc_code_challenge(code_verifier));
             query.append_pair("code_challenge_method", "S256");
@@ -949,7 +954,6 @@ async fn authenticate_oidc_with_browser_opener(
 
 async fn precomputed_authorization_header(
     config: &ClientConfig,
-    browser_opener: fn(String) -> Result<(), OidcError>,
 ) -> Result<Option<String>, ClientError> {
     if auth_method_count(config) > 1 {
         return Err(ClientError::ConflictingAuthenticationMethods);
@@ -964,11 +968,6 @@ async fn precomputed_authorization_header(
         return Ok(Some(bearer_authorization_value(token)));
     }
 
-    if let Some(oidc) = config.oidc.as_ref() {
-        let token = authenticate_oidc_with_browser_opener(oidc, browser_opener).await?;
-        return Ok(Some(bearer_authorization_value(&token)));
-    }
-
     if let Some(password) = config.password.as_deref() {
         let username = config
             .username
@@ -978,6 +977,57 @@ async fn precomputed_authorization_header(
     }
 
     Ok(None)
+}
+
+fn activate_client(
+    endpoint: Endpoint,
+    connection: Connection,
+    send_request: SendRequest,
+    driver_task: tokio::task::JoinHandle<()>,
+    established: EstablishedClientConversation,
+    max_packet_size: u64,
+    default_datagrams_queue_size: usize,
+) -> ActiveClient {
+    let channel_router = Arc::new(IncomingChannelRouter::new());
+    channel_router.register_conversation(established.conversation.clone());
+    let incoming_channels_task = tokio::spawn({
+        let channel_router = channel_router.clone();
+        let connection = connection.clone();
+        async move {
+            if let Err(err) = channel_router
+                .accept_and_route_channels_forever(connection)
+                .await
+                && !is_benign_route_error(&err)
+            {
+                eprintln!("ssh3-client incoming channel error: {err}");
+            }
+        }
+    });
+    let incoming_datagrams_task = tokio::spawn({
+        let connection = connection.clone();
+        let conversation = established.conversation.clone();
+        async move {
+            if let Err(err) = ssh3_h3::dispatch_datagrams_forever(conversation, connection).await
+                && !is_benign_datagram_dispatch_error(&err)
+            {
+                eprintln!("ssh3-client incoming datagram error: {err}");
+            }
+        }
+    });
+
+    ActiveClient {
+        endpoint,
+        connection,
+        conversation: established.conversation,
+        _control_stream: established.control_stream,
+        _send_request: send_request,
+        driver_task,
+        incoming_channels_task,
+        incoming_datagrams_task,
+        server_header: response_server_header(&established.response).map(str::to_owned),
+        max_packet_size,
+        default_datagrams_queue_size,
+    }
 }
 
 pub async fn run_exec_capture(
@@ -1030,8 +1080,7 @@ async fn connect_client_with_browser_opener(
     config: &ClientConfig,
     browser_opener: fn(String) -> Result<(), OidcError>,
 ) -> Result<ActiveClient, ClientError> {
-    let precomputed_authorization =
-        precomputed_authorization_header(config, browser_opener).await?;
+    let precomputed_authorization = precomputed_authorization_header(config).await?;
 
     let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
     let bind_addr = client_bind_addr(resolved.remote_addr);
@@ -1061,6 +1110,17 @@ async fn connect_client_with_browser_opener(
         request
             .headers_mut()
             .insert(http::header::AUTHORIZATION, HeaderValue::from_str(token)?);
+    } else if let Some(oidc) = config.oidc.as_ref() {
+        let token = authenticate_oidc_with_browser_opener(
+            oidc,
+            &conversation_id_base64(&conversation_id),
+            browser_opener,
+        )
+        .await?;
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(&bearer_authorization_value(&token))?,
+        );
     } else if let Some(identity_path) = config.identity_file.as_ref() {
         let username = config
             .username
@@ -1099,46 +1159,15 @@ async fn connect_client_with_browser_opener(
     )
     .await?;
     driver_task.abort();
-    let channel_router = Arc::new(IncomingChannelRouter::new());
-    channel_router.register_conversation(established.conversation.clone());
-    let incoming_channels_task = tokio::spawn({
-        let channel_router = channel_router.clone();
-        let connection = connection.clone();
-        async move {
-            if let Err(err) = channel_router
-                .accept_and_route_channels_forever(connection)
-                .await
-                && !is_benign_route_error(&err)
-            {
-                eprintln!("ssh3-client incoming channel error: {err}");
-            }
-        }
-    });
-    let incoming_datagrams_task = tokio::spawn({
-        let connection = connection.clone();
-        let conversation = established.conversation.clone();
-        async move {
-            if let Err(err) = ssh3_h3::dispatch_datagrams_forever(conversation, connection).await
-                && !is_benign_datagram_dispatch_error(&err)
-            {
-                eprintln!("ssh3-client incoming datagram error: {err}");
-            }
-        }
-    });
-
-    Ok(ActiveClient {
+    Ok(activate_client(
         endpoint,
         connection,
-        conversation: established.conversation,
-        _control_stream: established.control_stream,
-        _send_request: send_request,
+        send_request,
         driver_task,
-        incoming_channels_task,
-        incoming_datagrams_task,
-        server_header: response_server_header(&established.response).map(str::to_owned),
-        max_packet_size: config.max_packet_size,
-        default_datagrams_queue_size: config.default_datagrams_queue_size,
-    })
+        established,
+        config.max_packet_size,
+        config.default_datagrams_queue_size,
+    ))
 }
 
 fn client_quinn_config(trust: &TrustStrategy) -> Result<quinn::ClientConfig, ClientError> {
@@ -1472,9 +1501,16 @@ async fn forward_agent_channel(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::fs::File as StdFile;
+    use std::future::poll_fn;
     use std::io;
     #[cfg(unix)]
+    use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
     use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::process::{Command as StdCommand, Stdio};
@@ -1483,10 +1519,13 @@ mod tests {
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use http::StatusCode;
+    use http::{StatusCode, header::HeaderValue};
+    #[cfg(unix)]
+    use nix::pty::{Winsize, openpty};
     #[cfg(unix)]
     use nix::unistd::{Uid, User};
     use p256::SecretKey as P256SecretKey;
+    use quinn::Endpoint;
     use rand_core::OsRng;
     use rsa::BigUint as RsaBigUint;
     use rsa::RsaPrivateKey as JwtRsaPrivateKey;
@@ -1496,10 +1535,12 @@ mod tests {
     use signature::{SignatureEncoding, Signer};
     use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair};
     use ssh_key::{Algorithm, HashAlg, Signature};
+    use ssh3_auth::bearer_authorization_value;
     use ssh3_core::Channel;
     use ssh3_h3::{
-        SSH3_VERSION_STRING, accept_server_conversation, is_ssh3_connect, new_server,
-        response_with_server_header,
+        SSH3_USER_HEADER, SSH3_VERSION_STRING, accept_server_conversation, build_connect_request,
+        establish_client_conversation, generate_conversation_id, is_ssh3_connect, new_client,
+        new_server, response_with_server_header,
     };
     use ssh3_proto::{ChannelRequest, Message, SSH_EXTENDED_DATA_NONE};
     use ssh3_quinn::{
@@ -1521,8 +1562,10 @@ mod tests {
 
     use super::{
         CapturedSession, ClientConfig, ClientError, LocalTerminalInfo, OidcConfig, OidcError,
-        SessionRequest, TerminalSize, TrustStrategy, build_session_runtime, connect_client,
-        run_exec_capture, run_exec_capture_with_browser_opener, send_forward_agent_request,
+        SessionRequest, TerminalSize, TrustStrategy, activate_client, build_session_runtime,
+        client_bind_addr, client_quinn_config, connect_client, conversation_id_base64,
+        resolve_target, run_capture_on_client, run_exec_capture,
+        run_exec_capture_with_browser_opener, send_forward_agent_request,
         send_initial_session_requests, send_signal_request, send_window_change_request,
     };
 
@@ -1595,6 +1638,59 @@ mod tests {
         config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         let client = connect_client(&config).await.unwrap();
         (client, server_task)
+    }
+
+    async fn connect_client_with_authorization_builder(
+        config: &ClientConfig,
+        authorization_builder: impl FnOnce(&[u8; 32]) -> String,
+    ) -> Result<super::ActiveClient, ClientError> {
+        let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
+        let bind_addr = client_bind_addr(resolved.remote_addr);
+        let mut endpoint = Endpoint::client(bind_addr).map_err(ClientError::Endpoint)?;
+        endpoint.set_default_client_config(client_quinn_config(&config.trust)?);
+
+        let connection = endpoint
+            .connect(resolved.remote_addr, &resolved.server_name)
+            .map_err(ClientError::Connect)?
+            .await
+            .map_err(ClientError::Connection)?;
+
+        let (mut driver, mut send_request) = new_client(connection.clone()).await?;
+        let driver_task = tokio::spawn(async move {
+            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let conversation_id = generate_conversation_id(&connection)?;
+        let mut request = build_connect_request(config.target_url.clone(), &config.user_agent)?;
+        if let Some(username) = config.username.as_deref() {
+            request
+                .headers_mut()
+                .insert(SSH3_USER_HEADER, HeaderValue::from_str(username)?);
+        }
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(&authorization_builder(&conversation_id))?,
+        );
+
+        let established = establish_client_conversation(
+            &mut send_request,
+            connection.clone(),
+            request,
+            config.max_packet_size,
+            config.default_datagrams_queue_size,
+        )
+        .await?;
+        driver_task.abort();
+
+        Ok(activate_client(
+            endpoint,
+            connection,
+            send_request,
+            driver_task,
+            established,
+            config.max_packet_size,
+            config.default_datagrams_queue_size,
+        ))
     }
 
     #[cfg(unix)]
@@ -2259,6 +2355,177 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct GoCliPtySession {
+        child: tokio::process::Child,
+        writer: Arc<Mutex<StdFile>>,
+        controller: StdFile,
+        output: Arc<Mutex<Vec<u8>>>,
+        output_task: tokio::task::JoinHandle<io::Result<()>>,
+    }
+
+    #[cfg(unix)]
+    impl GoCliPtySession {
+        async fn write_all(&self, input: &str) {
+            let writer = self.writer.clone();
+            let input = input.as_bytes().to_vec();
+            tokio::task::spawn_blocking(move || -> io::Result<()> {
+                let mut writer = writer.lock().unwrap();
+                writer.write_all(&input)?;
+                writer.flush()?;
+                Ok(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        fn resize(&self, size: TerminalSize) -> io::Result<()> {
+            let winsize = Winsize {
+                ws_row: size.char_height,
+                ws_col: size.char_width,
+                ws_xpixel: size.pixel_width,
+                ws_ypixel: size.pixel_height,
+            };
+            let result = unsafe {
+                nix::libc::ioctl(self.controller.as_raw_fd(), nix::libc::TIOCSWINSZ, &winsize)
+            };
+            if result == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        fn send_signal(&self, signal: i32) -> io::Result<()> {
+            let pid = self
+                .child
+                .id()
+                .ok_or_else(|| io::Error::other("go CLI PTY child has no pid"))?
+                as i32;
+            let result = unsafe { nix::libc::kill(pid, signal) };
+            if result == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        fn output_string(&self) -> String {
+            String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+        }
+
+        async fn wait_for_output_fragment(&self, fragment: &str) {
+            let fragment = fragment.to_string();
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if self.output_string().replace('\r', "").contains(&fragment) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        async fn wait_with_output(mut self) -> std::process::Output {
+            let status = timeout(Duration::from_secs(20), self.child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            self.output_task.await.unwrap().unwrap();
+            std::process::Output {
+                status,
+                stdout: self.output.lock().unwrap().clone(),
+                stderr: Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn pty_eof(err: &io::Error) -> bool {
+        matches!(err.raw_os_error(), Some(code) if code == nix::libc::EIO)
+    }
+
+    #[cfg(unix)]
+    async fn spawn_go_cli_shell_with_pty(
+        home_dir: &Path,
+        url: &str,
+        private_key_path: &Path,
+        initial_size: TerminalSize,
+    ) -> GoCliPtySession {
+        let binaries = go_cli_binaries();
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+
+        let openpty = openpty(
+            Some(&Winsize {
+                ws_row: initial_size.char_height,
+                ws_col: initial_size.char_width,
+                ws_xpixel: initial_size.pixel_width,
+                ws_ypixel: initial_size.pixel_height,
+            }),
+            None,
+        )
+        .unwrap();
+        let master = StdFile::from(openpty.master);
+        let slave = StdFile::from(openpty.slave);
+
+        let mut child = TokioCommand::new(&binaries.client);
+        child
+            .arg("-insecure")
+            .arg("-privkey")
+            .arg(private_key_path)
+            .arg(url)
+            .env("HOME", home_dir)
+            .env("TERM", "xterm")
+            .kill_on_drop(true);
+
+        let slave_fd = slave.as_raw_fd();
+        child
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()));
+        unsafe {
+            child.pre_exec(move || {
+                if nix::libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let child = child.spawn().unwrap();
+        drop(slave);
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let output_reader = output.clone();
+        let mut reader = master.try_clone().unwrap();
+        let writer = Arc::new(Mutex::new(master.try_clone().unwrap()));
+        let output_task = tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => output_reader.lock().unwrap().extend_from_slice(&chunk[..n]),
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) if pty_eof(&err) => return Ok(()),
+                    Err(err) => return Err(err),
+                }
+            }
+        });
+
+        GoCliPtySession {
+            child,
+            writer,
+            controller: master,
+            output,
+            output_task,
+        }
+    }
+
+    #[cfg(unix)]
     async fn run_go_cli_shell(
         home_dir: &Path,
         url: &str,
@@ -2299,32 +2566,57 @@ mod tests {
             .unwrap()
     }
 
-    async fn run_shell_capture_on_client(
+    async fn run_shell_capture_with_resize_on_client(
         client: &super::ActiveClient,
-        terminal: LocalTerminalInfo,
-        shell_input: &str,
+        initial_terminal: LocalTerminalInfo,
+        resized_terminal: TerminalSize,
+        shell_input_prefix: &str,
+        shell_input_suffix: &str,
     ) -> Result<CapturedSession, ClientError> {
         let channel = client.open_session_channel().await?;
-        send_initial_session_requests(channel.as_ref(), &SessionRequest::Shell, Some(&terminal))
-            .await?;
+        send_initial_session_requests(
+            channel.as_ref(),
+            &SessionRequest::Shell,
+            Some(&initial_terminal),
+        )
+        .await?;
         channel
-            .write_data(shell_input.as_bytes(), SSH_EXTENDED_DATA_NONE)
+            .write_data(shell_input_prefix.as_bytes(), SSH_EXTENDED_DATA_NONE)
             .await
             .map_err(ClientError::from)?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let initial_size_fragment = format!(
+            "{} {}",
+            initial_terminal.size.char_height, initial_terminal.size.char_width
+        );
+        let mut resize_sent = false;
 
         loop {
             match timeout(Duration::from_secs(10), channel.next_message())
                 .await
                 .unwrap()?
             {
-                Message::Data(data) => match data.data_type {
-                    SSH_EXTENDED_DATA_NONE => stdout.extend_from_slice(&data.data),
-                    ssh3_proto::SSH_EXTENDED_DATA_STDERR => stderr.extend_from_slice(&data.data),
-                    _ => {}
-                },
+                Message::Data(data) => {
+                    match data.data_type {
+                        SSH_EXTENDED_DATA_NONE => stdout.extend_from_slice(&data.data),
+                        ssh3_proto::SSH_EXTENDED_DATA_STDERR => {
+                            stderr.extend_from_slice(&data.data)
+                        }
+                        _ => {}
+                    }
+                    if !resize_sent
+                        && String::from_utf8_lossy(&stdout).contains(&initial_size_fragment)
+                    {
+                        send_window_change_request(channel.as_ref(), resized_terminal).await?;
+                        channel
+                            .write_data(shell_input_suffix.as_bytes(), SSH_EXTENDED_DATA_NONE)
+                            .await
+                            .map_err(ClientError::from)?;
+                        resize_sent = true;
+                    }
+                }
                 Message::ChannelRequest(message) => match message.request {
                     ChannelRequest::ExitStatus(status) => {
                         return Ok(CapturedSession {
@@ -2851,14 +3143,27 @@ mod tests {
         authorized_identities_path: std::path::PathBuf,
         issuer_url: String,
         client_id: String,
+        email: String,
+        signing_key: JwtRsaPrivateKey,
         username: String,
-        bearer_token: String,
         provider_task: tokio::task::JoinHandle<()>,
     }
 
     impl Drop for OidcFixture {
         fn drop(&mut self) {
             self.provider_task.abort();
+        }
+    }
+
+    impl OidcFixture {
+        fn bearer_token_for_nonce(&self, nonce: &str) -> String {
+            build_oidc_token(
+                &self.issuer_url,
+                &self.client_id,
+                &self.email,
+                Some(nonce),
+                &self.signing_key,
+            )
         }
     }
 
@@ -2969,6 +3274,7 @@ mod tests {
         issuer_url: &str,
         client_id: &str,
         email: &str,
+        nonce: Option<&str>,
         private_key: &JwtRsaPrivateKey,
     ) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"test-key","typ":"JWT"}"#);
@@ -2977,9 +3283,12 @@ mod tests {
             .unwrap()
             .as_secs()
             + 60;
+        let nonce_claim = nonce
+            .map(|nonce| format!(r#","nonce":"{nonce}""#))
+            .unwrap_or_default();
         let claims = URL_SAFE_NO_PAD.encode(
             format!(
-                r#"{{"iss":"{issuer_url}","aud":"{client_id}","exp":{exp},"email":"{email}","email_verified":true}}"#
+                r#"{{"iss":"{issuer_url}","aud":"{client_id}","exp":{exp},"email":"{email}","email_verified":true{nonce_claim}}}"#
             )
             .as_bytes(),
         );
@@ -3011,8 +3320,10 @@ mod tests {
             URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be()),
         );
         let expected_challenge = Arc::new(Mutex::new(None::<String>));
+        let expected_nonce = Arc::new(Mutex::new(None::<String>));
         let provider_task = tokio::spawn({
             let expected_challenge = expected_challenge.clone();
+            let expected_nonce = expected_nonce.clone();
             let client_id = client_id.clone();
             let issuer_url = issuer_url.clone();
             let signing_key = signing_key.clone();
@@ -3023,9 +3334,16 @@ mod tests {
                     let jwks_body = jwks_body.clone();
                     let token_body = format!(
                         r#"{{"access_token":"mock-access-token","token_type":"Bearer","id_token":"{}"}}"#,
-                        build_oidc_token(&issuer_url, &client_id, email, &signing_key)
+                        build_oidc_token(
+                            &issuer_url,
+                            &client_id,
+                            email,
+                            expected_nonce.lock().unwrap().as_deref(),
+                            &signing_key,
+                        )
                     );
                     let expected_challenge = expected_challenge.clone();
+                    let expected_nonce = expected_nonce.clone();
                     let client_id = client_id.clone();
                     tokio::spawn(async move {
                         let request = read_http_request(&mut stream).await.unwrap();
@@ -3056,6 +3374,8 @@ mod tests {
                                 );
                                 *expected_challenge.lock().unwrap() =
                                     http_query_value(&request.target, "code_challenge");
+                                *expected_nonce.lock().unwrap() =
+                                    http_query_value(&request.target, "nonce");
                                 let redirect_uri =
                                     http_query_value(&request.target, "redirect_uri").unwrap();
                                 let state = http_query_value(&request.target, "state").unwrap();
@@ -3119,6 +3439,8 @@ mod tests {
             authorized_identities_path,
             issuer_url: issuer_url.clone(),
             client_id: client_id.clone(),
+            email: email.to_string(),
+            signing_key,
             username: {
                 #[cfg(unix)]
                 {
@@ -3129,7 +3451,6 @@ mod tests {
                     "user".to_string()
                 }
             },
-            bearer_token: build_oidc_token(&issuer_url, &client_id, email, &signing_key),
             provider_task,
         }
     }
@@ -3306,8 +3627,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rust_client_exec_capture_round_trips_with_extra_pubkey_algorithms_against_the_real_go_server(
-    ) {
+    async fn rust_client_exec_capture_round_trips_with_extra_pubkey_algorithms_against_the_real_go_server()
+     {
         let _guard = lock_go_binary_tests();
 
         for (algorithm, label) in [
@@ -3440,7 +3761,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(session.exit_status, 0, "{session:?}");
-        assert_eq!(session.stdout, b"hello from rust oidc to real go\n".to_vec());
+        assert_eq!(
+            session.stdout,
+            b"hello from rust oidc to real go\n".to_vec()
+        );
         assert!(session.stderr.is_empty(), "{session:?}");
         assert!(
             session
@@ -3942,7 +4266,7 @@ mod tests {
         let client = connect_client(&config).await.unwrap();
         let session = timeout(
             Duration::from_secs(20),
-            run_shell_capture_on_client(
+            run_shell_capture_with_resize_on_client(
                 &client,
                 LocalTerminalInfo {
                     term: Some("xterm-256color".to_string()),
@@ -3953,6 +4277,13 @@ mod tests {
                         pixel_height: 480,
                     },
                 },
+                TerminalSize {
+                    char_width: 100,
+                    char_height: 40,
+                    pixel_width: 800,
+                    pixel_height: 600,
+                },
+                "stty size\n",
                 "stty size\nprintf '__SSH3_PTY_RUST_CLIENT_OK__:%s\\n' \"$TERM\"\nexit\n",
             ),
         )
@@ -3964,6 +4295,7 @@ mod tests {
         assert_eq!(session.exit_status, 0, "{session:?}");
         let stdout = String::from_utf8_lossy(&session.stdout);
         assert!(stdout.contains("24 80"), "{stdout}");
+        assert!(stdout.contains("40 100"), "{stdout}");
         assert!(
             stdout.contains("__SSH3_PTY_RUST_CLIENT_OK__:xterm-256color"),
             "{stdout}"
@@ -4031,6 +4363,152 @@ mod tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("could not establish"), "{output:?}");
         assert!(!stderr.contains("an error was encountered"), "{output:?}");
+
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_window_change_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let private_key_path = fixture.private_key_path.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let session = spawn_go_cli_shell_with_pty(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &private_key_path,
+            TerminalSize {
+                char_width: 80,
+                char_height: 24,
+                pixel_width: 640,
+                pixel_height: 480,
+            },
+        )
+        .await;
+        session.write_all("stty size\n").await;
+        session.wait_for_output_fragment("24 80").await;
+        session
+            .resize(TerminalSize {
+                char_width: 100,
+                char_height: 40,
+                pixel_width: 800,
+                pixel_height: 600,
+            })
+            .unwrap();
+        session
+            .write_all("stty size\nprintf '__SSH3_GO_CLIENT_RESIZE_OK__\\n'\nexit\n")
+            .await;
+        let output = session.wait_with_output().await;
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        assert!(stdout.contains("24 80"), "{stdout}");
+        assert!(stdout.contains("40 100"), "{stdout}");
+        assert!(stdout.contains("__SSH3_GO_CLIENT_RESIZE_OK__"), "{stdout}");
+
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_signal_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let private_key_path = fixture.private_key_path.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let session = spawn_go_cli_shell_with_pty(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &private_key_path,
+            TerminalSize {
+                char_width: 80,
+                char_height: 24,
+                pixel_width: 640,
+                pixel_height: 480,
+            },
+        )
+        .await;
+        session.write_all("stty size\n").await;
+        session.wait_for_output_fragment("24 80").await;
+        session
+            .write_all(
+                "trap 'printf __SSH3_GO_CLIENT_SIGNAL_OK__\\\\n; exit 0' TERM\nprintf '__SSH3_SIGNAL_ARMED__:%s\\n' \"$TERM\"\nwhile :; do sleep 1; done\n",
+            )
+            .await;
+        session
+            .wait_for_output_fragment("__SSH3_SIGNAL_ARMED__:xterm")
+            .await;
+        session.send_signal(nix::libc::SIGTERM).unwrap();
+        let output = session.wait_with_output().await;
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        assert!(stdout.contains("__SSH3_GO_CLIENT_SIGNAL_OK__"), "{stdout}");
 
         if server_task.is_finished() {
             server_task.await.unwrap();
@@ -4842,7 +5320,6 @@ mod tests {
         let fixture = create_oidc_fixture().await;
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
-        let bearer_token = fixture.bearer_token.clone();
         let (server_config, server_certificate) =
             self_signed_server_config(vec!["localhost".to_string()]).unwrap();
         let server_endpoint = quinn::Endpoint::server(
@@ -4881,15 +5358,25 @@ mod tests {
         );
         config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
-        config.bearer_token = Some(bearer_token);
-
+        let client = connect_client_with_authorization_builder(&config, |conversation_id| {
+            bearer_authorization_value(
+                &fixture.bearer_token_for_nonce(&conversation_id_base64(conversation_id)),
+            )
+        })
+        .await
+        .unwrap();
         let session = tokio::time::timeout(
             Duration::from_secs(10),
-            run_exec_capture(&config, "printf 'authenticated via oidc\\n'"),
+            run_capture_on_client(
+                &client,
+                &config,
+                SessionRequest::Exec("printf 'authenticated via oidc\\n'".to_string()),
+            ),
         )
         .await
         .unwrap()
         .unwrap();
+        client.shutdown().await;
 
         assert_eq!(
             session,

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
 	"time"
@@ -52,6 +53,85 @@ type NoSuitableIdentity struct{}
 
 func (e NoSuitableIdentity) Error() string {
 	return "no suitable identity found"
+}
+
+var forwardedSignals = map[syscall.Signal]string{
+	syscall.SIGHUP:  "HUP",
+	syscall.SIGINT:  "INT",
+	syscall.SIGQUIT: "QUIT",
+	syscall.SIGTERM: "TERM",
+	syscall.SIGUSR1: "USR1",
+	syscall.SIGUSR2: "USR2",
+}
+
+func sendWindowChangeRequest(channel ssh3.Channel, tty *os.File) error {
+	windowSize, err := winsize.GetWinsize(tty)
+	if err != nil {
+		return err
+	}
+	return channel.SendRequest(
+		&ssh3Messages.ChannelRequestMessage{
+			WantReply: false,
+			ChannelRequest: &ssh3Messages.WindowChangeRequest{
+				CharWidth:   uint64(windowSize.NCols),
+				CharHeight:  uint64(windowSize.NRows),
+				PixelWidth:  uint64(windowSize.PixelWidth),
+				PixelHeight: uint64(windowSize.PixelHeight),
+			},
+		},
+	)
+}
+
+func forwardWindowChanges(ctx context.Context, channel ssh3.Channel, tty *os.File) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGWINCH)
+	defer signal.Stop(signals)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-signals:
+			if err := sendWindowChangeRequest(channel, tty); err != nil {
+				log.Warn().Msgf("could not send window change request: %s", err)
+				return
+			}
+		}
+	}
+}
+
+func forwardSessionSignals(ctx context.Context, channel ssh3.Channel) {
+	signals := make(chan os.Signal, len(forwardedSignals))
+	notifiedSignals := make([]os.Signal, 0, len(forwardedSignals))
+	for signal := range forwardedSignals {
+		notifiedSignals = append(notifiedSignals, signal)
+	}
+	signal.Notify(signals, notifiedSignals...)
+	defer signal.Stop(signals)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case receivedSignal := <-signals:
+			signalName, ok := forwardedSignals[receivedSignal.(syscall.Signal)]
+			if !ok {
+				continue
+			}
+			err := channel.SendRequest(
+				&ssh3Messages.ChannelRequestMessage{
+					WantReply: false,
+					ChannelRequest: &ssh3Messages.SignalRequest{
+						SignalNameWithoutSig: signalName,
+					},
+				},
+			)
+			if err != nil {
+				log.Warn().Msgf("could not send signal request for %s: %s", signalName, err)
+				return
+			}
+		}
+	}
 }
 
 func forwardAgent(parent context.Context, channel ssh3.Channel) error {
@@ -361,7 +441,7 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 				identity = m.IntoIdentity(sshAgent)
 			case *ssh3.OidcAuthMethod:
 				log.Debug().Msgf("try OIDC auth to issuer %s", m.OIDCConfig().IssuerUrl)
-				token, err := oidc.Connect(context.Background(), m.OIDCConfig(), m.OIDCConfig().IssuerUrl, m.DoPKCE())
+				token, err := oidc.Connect(context.Background(), m.OIDCConfig(), m.OIDCConfig().IssuerUrl, m.DoPKCE(), conv.ConversationID().String())
 				if err != nil {
 					log.Error().Msgf("could not get token: %s", err)
 					return nil, err
@@ -570,6 +650,10 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 				log.Warn().Msgf("cannot make tty raw: %s", err)
 			} else {
 				defer term.Restore(int(fd), oldState)
+			}
+			go forwardSessionSignals(ctx, channel)
+			if hasWinSize {
+				go forwardWindowChanges(ctx, channel, tty)
 			}
 		}
 	} else {

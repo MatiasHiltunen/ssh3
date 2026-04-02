@@ -357,6 +357,7 @@ pub fn conversation_id_base64(conversation_id: &[u8; 32]) -> String {
 pub async fn verify_oidc_identity_token(
     identity: &OidcIdentity,
     token: &str,
+    expected_nonce: Option<&str>,
 ) -> Result<(), AuthError> {
     let (signing_input, signature_part) = token
         .rsplit_once('.')
@@ -382,6 +383,11 @@ pub async fn verify_oidc_identity_token(
     }
     if !claims.email_verified {
         return Err(AuthError::InvalidToken("OIDC email is not verified"));
+    }
+    if let Some(expected_nonce) = expected_nonce
+        && claims.nonce.as_deref() != Some(expected_nonce)
+    {
+        return Err(AuthError::InvalidToken("unexpected OIDC nonce"));
     }
 
     let client = reqwest::Client::new();
@@ -587,6 +593,8 @@ struct OidcClaims {
     aud: OidcAudience,
     exp: u64,
     #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
     email: Option<String>,
     #[serde(default)]
     email_verified: bool,
@@ -746,6 +754,7 @@ mod tests {
 
     struct OidcTestFixture {
         identity: OidcIdentity,
+        nonce: String,
         token: String,
         task: tokio::task::JoinHandle<()>,
     }
@@ -761,6 +770,7 @@ mod tests {
         let issuer_url = format!("http://{}", listener.local_addr().unwrap());
         let client_id = "ssh3-client-id".to_string();
         let email = "alice@example.com".to_string();
+        let nonce = "expected-ssh3-conversation".to_string();
         let signing_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
         let public_key = signing_key.to_public_key();
         let discovery_body =
@@ -798,7 +808,8 @@ mod tests {
                 issuer_url: issuer_url.clone(),
                 email: email.clone(),
             },
-            token: build_oidc_token(&issuer_url, &client_id, &email, &signing_key),
+            nonce: nonce.clone(),
+            token: build_oidc_token(&issuer_url, &client_id, &email, Some(&nonce), &signing_key),
             task,
         }
     }
@@ -831,6 +842,7 @@ mod tests {
         issuer_url: &str,
         client_id: &str,
         email: &str,
+        nonce: Option<&str>,
         private_key: &RsaPrivateKey,
     ) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"test-key","typ":"JWT"}"#);
@@ -839,9 +851,12 @@ mod tests {
             .unwrap()
             .as_secs()
             + Duration::from_secs(60).as_secs();
+        let nonce_claim = nonce
+            .map(|nonce| format!(r#","nonce":"{nonce}""#))
+            .unwrap_or_default();
         let claims = URL_SAFE_NO_PAD.encode(
             format!(
-                r#"{{"iss":"{issuer_url}","aud":"{client_id}","exp":{exp},"email":"{email}","email_verified":true}}"#
+                r#"{{"iss":"{issuer_url}","aud":"{client_id}","exp":{exp},"email":"{email}","email_verified":true{nonce_claim}}}"#
             )
             .as_bytes(),
         );
@@ -942,8 +957,18 @@ mod tests {
     #[tokio::test]
     async fn oidc_tokens_round_trip_against_a_mock_issuer() {
         let fixture = start_oidc_fixture().await;
-        verify_oidc_identity_token(&fixture.identity, &fixture.token)
+        verify_oidc_identity_token(&fixture.identity, &fixture.token, Some(&fixture.nonce))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oidc_tokens_reject_the_wrong_nonce() {
+        let fixture = start_oidc_fixture().await;
+        let err =
+            verify_oidc_identity_token(&fixture.identity, &fixture.token, Some("wrong-nonce"))
+                .await
+                .unwrap_err();
+        assert_eq!(err.to_string(), "unexpected OIDC nonce");
     }
 }

@@ -27,8 +27,8 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::{Gid, Pid, Uid, User};
 use quinn::{Connection, ConnectionError, Endpoint};
 use ssh3_auth::{
-    AuthError, AuthorizedIdentity, load_authorized_identities_from_paths, verify_bearer_token,
-    verify_oidc_identity_token,
+    AuthError, AuthorizedIdentity, conversation_id_base64, load_authorized_identities_from_paths,
+    verify_bearer_token, verify_oidc_identity_token,
 };
 use ssh3_core::{AcceptedChannel, Channel, ChannelError, ConversationError};
 use ssh3_h3::{
@@ -450,9 +450,14 @@ async fn authorize_request(
                         }
                     }
                     AuthorizedIdentity::Oidc(oidc_identity) => {
-                        if verify_oidc_identity_token(oidc_identity, token)
-                            .await
-                            .is_ok()
+                        let expected_nonce = conversation_id_base64(conversation_id);
+                        if verify_oidc_identity_token(
+                            oidc_identity,
+                            token,
+                            Some(expected_nonce.as_str()),
+                        )
+                        .await
+                        .is_ok()
                         {
                             return Ok(true);
                         }
@@ -1921,7 +1926,7 @@ mod tests {
     use sha2::Sha256;
     use signature::{SignatureEncoding, Signer};
     use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, RsaKeypair};
-    use ssh3_auth::build_bearer_token;
+    use ssh3_auth::{build_bearer_token, conversation_id_base64};
     use ssh3_core::{Channel, Conversation};
     use ssh3_h3::{
         ClientControlStream, ClientConversationError, SSH3_USER_HEADER, SSH3_VERSION_STRING,
@@ -2069,6 +2074,95 @@ mod tests {
             }
         };
 
+        Ok(TestHarness {
+            client_endpoint,
+            client_connection,
+            conversation: established.conversation,
+            _control_stream: established.control_stream,
+            _send_request: send_request,
+            driver_task,
+            server_task,
+        })
+    }
+
+    async fn attempt_oidc_harness(
+        server_config: ServerConfig,
+        requested_user: Option<&str>,
+        fixture: &OidcFixture,
+    ) -> Result<TestHarness, ClientConversationError> {
+        let (server_config_tls, server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config_tls,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let mut client_endpoint =
+            quinn::Endpoint::client(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+                .unwrap();
+        client_endpoint
+            .set_default_client_config(client_config_for_certificate(server_certificate).unwrap());
+
+        let client_connecting = client_endpoint.connect(server_addr, "localhost").unwrap();
+        let server_task = tokio::spawn(async move {
+            let incoming = timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            timeout(
+                Duration::from_secs(10),
+                serve_connection(connection, server_config),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        });
+        let client_connection = timeout(Duration::from_secs(5), client_connecting)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (mut driver, mut send_request) = new_client(client_connection.clone()).await.unwrap();
+        let driver_task = tokio::spawn(async move {
+            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let conversation_id = generate_conversation_id(&client_connection).unwrap();
+        let mut request = build_connect_request(
+            "https://localhost/ssh3-term".parse().unwrap(),
+            SSH3_VERSION_STRING,
+        )
+        .unwrap();
+        if let Some(requested_user) = requested_user {
+            request.headers_mut().insert(
+                SSH3_USER_HEADER,
+                HeaderValue::from_str(requested_user).unwrap(),
+            );
+        }
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_str(&fixture.authorization_for_conversation(&conversation_id))
+                .unwrap(),
+        );
+        let established = timeout(
+            Duration::from_secs(5),
+            establish_client_conversation(
+                &mut send_request,
+                client_connection.clone(),
+                request,
+                30_000,
+                10,
+            ),
+        )
+        .await
+        .unwrap()?;
+
+        driver_task.abort();
         Ok(TestHarness {
             client_endpoint,
             client_connection,
@@ -2284,14 +2378,29 @@ mod tests {
     struct OidcFixture {
         _tempdir: TempDir,
         authorized_identities_path: PathBuf,
+        issuer_url: String,
+        client_id: String,
+        email: String,
+        signing_key: JwtRsaPrivateKey,
         username: String,
-        authorization: String,
         provider_task: tokio::task::JoinHandle<()>,
     }
 
     impl Drop for OidcFixture {
         fn drop(&mut self) {
             self.provider_task.abort();
+        }
+    }
+
+    impl OidcFixture {
+        fn authorization_for_conversation(&self, conversation_id: &[u8; 32]) -> String {
+            build_oidc_token(
+                &self.issuer_url,
+                &self.client_id,
+                &self.email,
+                Some(&conversation_id_base64(conversation_id)),
+                &self.signing_key,
+            )
         }
     }
 
@@ -2323,6 +2432,7 @@ mod tests {
         issuer_url: &str,
         client_id: &str,
         email: &str,
+        nonce: Option<&str>,
         private_key: &JwtRsaPrivateKey,
     ) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"test-key","typ":"JWT"}"#);
@@ -2331,9 +2441,12 @@ mod tests {
             .unwrap()
             .as_secs()
             + 60;
+        let nonce_claim = nonce
+            .map(|nonce| format!(r#","nonce":"{nonce}""#))
+            .unwrap_or_default();
         let claims = URL_SAFE_NO_PAD.encode(
             format!(
-                r#"{{"iss":"{issuer_url}","aud":"{client_id}","exp":{exp},"email":"{email}","email_verified":true}}"#
+                r#"{{"iss":"{issuer_url}","aud":"{client_id}","exp":{exp},"email":"{email}","email_verified":true{nonce_claim}}}"#
             )
             .as_bytes(),
         );
@@ -2393,8 +2506,11 @@ mod tests {
         OidcFixture {
             _tempdir: tempdir,
             authorized_identities_path,
+            issuer_url: issuer_url.clone(),
+            client_id: client_id.to_string(),
+            email: email.to_string(),
+            signing_key,
             username: current_username().unwrap(),
-            authorization: build_oidc_token(&issuer_url, client_id, email, &signing_key),
             provider_task,
         }
     }
@@ -2606,13 +2722,9 @@ mod tests {
         config.authorized_identity_paths = vec![fixture.authorized_identities_path.clone()];
         config.default_user = Some("does-not-exist".to_string());
 
-        let harness = attempt_harness_with_headers(
-            config,
-            Some(&fixture.username),
-            Some(&fixture.authorization),
-        )
-        .await
-        .unwrap();
+        let harness = attempt_oidc_harness(config, Some(&fixture.username), &fixture)
+            .await
+            .unwrap();
         let channel = harness.open_session_channel().await;
         channel
             .send_request(ChannelRequestMessage {
