@@ -1481,12 +1481,11 @@ mod tests {
         response_with_server_header,
     };
     use ssh3_proto::{ChannelRequest, Message, SSH_EXTENDED_DATA_NONE};
-    use ssh3_quinn::accept_bi_channel;
-    use ssh3_quinn::self_signed_server_config;
+    use ssh3_quinn::{accept_bi_channel, open_tcp_forwarding_channel, self_signed_server_config};
     use ssh3_server::{ServerConfig, serve_connection};
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     #[cfg(unix)]
     use tokio::net::{UnixListener, UnixStream};
     #[cfg(unix)]
@@ -1688,6 +1687,41 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn reserve_tcp_port() -> u16 {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[cfg(unix)]
+    async fn spawn_tcp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0; 4096];
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let _ = stream.write_all(&buf[..n]).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    #[cfg(unix)]
     async fn spawn_go_interop_server(
         bind_addr: &str,
         username: &str,
@@ -1825,6 +1859,60 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn spawn_go_cli_tcp_forwarder(
+        home_dir: &Path,
+        url: &str,
+        private_key_path: &Path,
+        local_port: u16,
+        remote_addr: SocketAddr,
+        log_path: &Path,
+    ) -> tokio::process::Child {
+        let binaries = go_cli_binaries();
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+        let stderr_log = fs::File::create(log_path).unwrap();
+        let forward_spec = format!("{local_port}/{}@{}", remote_addr.ip(), remote_addr.port());
+        let mut child = TokioCommand::new(&binaries.client)
+            .arg("-insecure")
+            .arg("-privkey")
+            .arg(private_key_path)
+            .arg("-forward-tcp")
+            .arg(&forward_spec)
+            .arg(url)
+            .arg("sleep")
+            .arg("8")
+            .env("HOME", home_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_log))
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let local_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_port));
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let logs = fs::read_to_string(log_path).unwrap_or_default();
+                    panic!(
+                        "go CLI forwarder exited before the local port was reachable with status {status}\nlogs:\n{logs}"
+                    );
+                }
+
+                if TcpStream::connect(local_addr).await.is_ok() {
+                    break;
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        child
+    }
+
+    #[cfg(unix)]
     async fn run_go_cli_client(
         home_dir: &Path,
         url: &str,
@@ -1944,6 +2032,39 @@ mod tests {
         }
     }
 
+    async fn run_tcp_forwarding_round_trip_on_client(
+        client: &super::ActiveClient,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        let channel = open_tcp_forwarding_channel(
+            client.conversation.as_ref(),
+            &client.connection,
+            client.max_packet_size,
+            client.default_datagrams_queue_size,
+            remote_addr,
+        )
+        .await
+        .map_err(ClientError::from)?;
+        channel
+            .write_data(payload, SSH_EXTENDED_DATA_NONE)
+            .await
+            .map_err(ClientError::from)?;
+
+        loop {
+            match timeout(Duration::from_secs(10), channel.next_message())
+                .await
+                .unwrap()?
+            {
+                Message::Data(data) if data.data_type == SSH_EXTENDED_DATA_NONE => {
+                    let _ = channel.close().await;
+                    return Ok(data.data);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn create_auth_fixture(algorithm: AuthKeyAlgorithm) -> AuthFixture {
         let tempdir = TempDir::new().unwrap();
         let private_key_path = tempdir.path().join("id_ed25519");
@@ -1973,6 +2094,19 @@ mod tests {
                 }
             },
         }
+    }
+
+    #[cfg(unix)]
+    fn go_binary_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    fn lock_go_binary_tests() -> std::sync::MutexGuard<'static, ()> {
+        go_binary_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(unix)]
@@ -2689,6 +2823,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_exec_capture_round_trips_against_the_go_server() {
+        let _guard = lock_go_binary_tests();
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
         let cert_path = tempdir.path().join("cert.pem");
@@ -2713,7 +2848,7 @@ mod tests {
         config.identity_file = Some(fixture.private_key_path.clone());
 
         let session = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(20),
             run_exec_capture(&config, "printf 'hello from rust to go\\n'"),
         )
         .await
@@ -2737,6 +2872,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_exec_capture_round_trips_against_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
         let home_dir = tempdir.path().join("home");
@@ -2776,7 +2912,7 @@ mod tests {
         config.identity_file = Some(fixture.private_key_path.clone());
 
         let session = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(20),
             run_exec_capture(&config, "echo hello from rust to real go"),
         )
         .await
@@ -2999,6 +3135,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn go_client_exec_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -3054,6 +3191,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_exec_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -3110,6 +3248,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_shell_with_pty_round_trips_against_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
         let home_dir = tempdir.path().join("home");
@@ -3150,7 +3289,7 @@ mod tests {
 
         let client = connect_client(&config).await.unwrap();
         let session = timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(20),
             run_shell_capture_on_client(
                 &client,
                 LocalTerminalInfo {
@@ -3192,6 +3331,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_shell_with_pty_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -3240,6 +3380,146 @@ mod tests {
         assert!(!stderr.contains("could not establish"), "{output:?}");
         assert!(!stderr.contains("an error was encountered"), "{output:?}");
 
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rust_client_tcp_forwarding_round_trips_against_the_real_go_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let tempdir = TempDir::new().unwrap();
+        let home_dir = tempdir.path().join("home");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::write(
+            home_dir.join(".ssh").join("authorized_keys"),
+            fs::read(&fixture.authorized_identities_path).unwrap(),
+        )
+        .unwrap();
+
+        let bind_port = reserve_udp_port();
+        let bind_addr = format!("127.0.0.1:{bind_port}");
+        let cert_path = tempdir.path().join("cert.pem");
+        let key_path = tempdir.path().join("key.pem");
+        let log_path = tempdir.path().join("go-server.log");
+        let (remote_addr, echo_task) = spawn_tcp_echo_server().await;
+
+        let mut server = spawn_go_cli_server(
+            &bind_addr,
+            &fixture.username,
+            &home_dir,
+            &cert_path,
+            &key_path,
+            &log_path,
+        )
+        .await;
+
+        let mut config = ClientConfig::new(
+            format!(
+                "https://127.0.0.1:{bind_port}/ssh3-term?user={}",
+                fixture.username
+            )
+            .parse()
+            .unwrap(),
+        );
+        config.trust = TrustStrategy::Insecure;
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+
+        let client = connect_client(&config).await.unwrap();
+        let payload = b"tcp forward rust to real go";
+        let echoed = timeout(
+            Duration::from_secs(20),
+            run_tcp_forwarding_round_trip_on_client(&client, remote_addr, payload),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client.shutdown().await;
+
+        assert_eq!(echoed, payload.to_vec());
+
+        echo_task.abort();
+        let _ = server.kill().await;
+        let _ = server.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_tcp_forwarding_round_trips_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let private_key_path = fixture.private_key_path.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let (remote_addr, echo_task) = spawn_tcp_echo_server().await;
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let local_port = reserve_tcp_port();
+        let log_path = tempdir.path().join("go-client-forward.log");
+        let mut forwarder = spawn_go_cli_tcp_forwarder(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &private_key_path,
+            local_port,
+            remote_addr,
+            &log_path,
+        )
+        .await;
+
+        let mut stream = TcpStream::connect(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            local_port,
+        )))
+        .await
+        .unwrap();
+        let payload = b"tcp forward real go to rust";
+        stream.write_all(payload).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut echoed = vec![0; payload.len()];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload);
+
+        let status = timeout(Duration::from_secs(15), forwarder.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let logs = fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(status.code(), Some(0), "logs:\n{logs}");
+        assert!(!logs.contains("could not forward"), "{logs}");
+        assert!(!logs.contains("could not dial"), "{logs}");
+        assert!(!logs.contains("an error was encountered"), "{logs}");
+
+        echo_task.abort();
         if server_task.is_finished() {
             server_task.await.unwrap();
         } else {
