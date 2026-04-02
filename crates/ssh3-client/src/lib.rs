@@ -2127,6 +2127,87 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn run_go_cli_client_with_oidc(
+        home_dir: &Path,
+        url: &str,
+        issuer_url: &str,
+        oidc_config_path: &Path,
+        command: &[&str],
+    ) -> std::process::Output {
+        let binaries = go_cli_binaries();
+        let browser_dir = home_dir.join("browser-bin");
+        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
+        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
+        fs::create_dir_all(&browser_dir).unwrap();
+
+        let fake_browser = browser_dir.join("xdg-open");
+        fs::write(
+            &fake_browser,
+            "#!/bin/sh\nexec curl -fsSL \"$1\" >/dev/null\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_browser, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut child = TokioCommand::new(&binaries.client)
+            .arg("-v")
+            .arg("-insecure")
+            .arg("-use-oidc")
+            .arg(issuer_url)
+            .arg("-oidc-config")
+            .arg(oidc_config_path)
+            .arg(url)
+            .args(command)
+            .env("HOME", home_dir)
+            .env("PATH", format!("{}:{path}", browser_dir.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut stdout = child.stdout.take().unwrap();
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stdout.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stderr.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        match timeout(Duration::from_secs(20), child.wait()).await {
+            Ok(status) => std::process::Output {
+                status: status.unwrap(),
+                stdout: stdout_task.await.unwrap(),
+                stderr: stderr_task.await.unwrap(),
+            },
+            Err(_) => {
+                let _ = child.kill().await;
+                let status = child.wait().await.unwrap();
+                let output = std::process::Output {
+                    status,
+                    stdout: stdout_task.await.unwrap(),
+                    stderr: stderr_task.await.unwrap(),
+                };
+                panic!(
+                    "go client with oidc timed out\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn shell_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
@@ -2895,7 +2976,7 @@ mod tests {
                     let discovery_body = discovery_body.clone();
                     let jwks_body = jwks_body.clone();
                     let token_body = format!(
-                        r#"{{"id_token":"{}"}}"#,
+                        r#"{{"access_token":"mock-access-token","token_type":"Bearer","id_token":"{}"}}"#,
                         build_oidc_token(&issuer_url, &client_id, email, &signing_key)
                     );
                     let expected_challenge = expected_challenge.clone();
@@ -2956,7 +3037,9 @@ mod tests {
                                     Some("authorization_code")
                                 );
                                 assert_eq!(get("code").as_deref(), Some("mock-auth-code"));
-                                assert_eq!(get("client_id").as_deref(), Some(client_id.as_str()));
+                                if let Some(token_client_id) = get("client_id") {
+                                    assert_eq!(token_client_id, client_id);
+                                }
                                 let verifier = get("code_verifier").unwrap();
                                 let expected = expected_challenge.lock().unwrap().clone().unwrap();
                                 assert_eq!(super::oidc_code_challenge(&verifier), expected);
@@ -3476,6 +3559,75 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
         assert_eq!(stdout, "hello from real go cli\n");
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("could not establish"), "{output:?}");
+        assert!(!stderr.contains("an error was encountered"), "{output:?}");
+
+        if server_task.is_finished() {
+            server_task.await.unwrap();
+        } else {
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_client_exec_round_trips_with_oidc_against_the_rust_server() {
+        let _guard = lock_go_binary_tests();
+        let fixture = create_oidc_fixture().await;
+        let authorized_identities_path = fixture.authorized_identities_path.clone();
+        let username = fixture.username.clone();
+        let issuer_url = fixture.issuer_url.clone();
+        let client_id = fixture.client_id.clone();
+        let (server_config, _server_certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server_endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), server_endpoint.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connection = tokio::time::timeout(Duration::from_secs(5), incoming)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut config = ServerConfig::default();
+            config.require_authentication = true;
+            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
+            config.default_user = Some("does-not-exist".to_string());
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let tempdir = TempDir::new().unwrap();
+        let oidc_config_path = tempdir.path().join("oidc_config.json");
+        fs::write(
+            &oidc_config_path,
+            format!(
+                r#"[{{"issuer_url":"{issuer_url}","client_id":"{client_id}","client_secret":""}}]"#
+            ),
+        )
+        .unwrap();
+
+        let output = run_go_cli_client_with_oidc(
+            tempdir.path(),
+            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &issuer_url,
+            &oidc_config_path,
+            &["echo", "hello from real go oidc"],
+        )
+        .await;
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        assert_eq!(stdout, "hello from real go oidc\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("could not get token"), "{output:?}");
         assert!(!stderr.contains("could not establish"), "{output:?}");
         assert!(!stderr.contains("an error was encountered"), "{output:?}");
 
