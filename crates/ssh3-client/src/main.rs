@@ -1,249 +1,228 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use clap::{ArgGroup, CommandFactory, Parser, ValueHint, error::ErrorKind};
 use http::Uri;
 use ssh3_client::{
     AgentSelection, ClientConfig, OidcConfig, SessionRequest, TrustStrategy, load_certificates,
     run_session_stdio,
 };
 
-fn usage(program: &str) -> String {
-    format!(
-        "Usage: {program} [--server-name NAME] [--user NAME] [--identity PATH | --agent [--agent-socket PATH] | --agent-key PATH [--agent-socket PATH] | --password PASS | --password-file PATH | --bearer-token TOKEN | --bearer-token-file PATH | --use-oidc ISSUER --oidc-client-id ID [--oidc-client-secret SECRET] [--no-pkce]] [--forward-agent [--agent-socket PATH]] [--ca-cert PATH] [--insecure] URL [COMMAND...]\n\
-         \n\
-         Connects to an SSH3 server over QUIC/HTTP3. If COMMAND is omitted, requests a shell."
+#[derive(Debug, Parser)]
+#[command(
+    name = "ssh3-client",
+    version,
+    about = "Connects to an SSH3 server over QUIC/HTTP3. If COMMAND is omitted, requests a shell.",
+    group(
+        ArgGroup::new("auth")
+            .args([
+                "identity",
+                "agent",
+                "agent_key",
+                "password",
+                "password_file",
+                "bearer_token",
+                "bearer_token_file",
+                "oidc_issuer_url",
+            ])
+            .multiple(false)
     )
+)]
+struct Cli {
+    #[arg(long, value_name = "NAME")]
+    server_name: Option<String>,
+
+    #[arg(long, value_name = "NAME")]
+    user: Option<String>,
+
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    identity: Option<PathBuf>,
+
+    #[arg(long, requires = "user", conflicts_with = "agent_key")]
+    agent: bool,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath,
+        requires = "user",
+        conflicts_with = "agent"
+    )]
+    agent_key: Option<PathBuf>,
+
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    agent_socket: Option<PathBuf>,
+
+    #[arg(long)]
+    forward_agent: bool,
+
+    #[arg(
+        long,
+        value_name = "PASS",
+        requires = "user",
+        conflicts_with = "password_file",
+        help = "Password for basic authentication. Prefer --password-file to avoid exposing secrets in argv."
+    )]
+    password: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath,
+        requires = "user",
+        conflicts_with = "password",
+        help = "Read the basic-auth password from a file."
+    )]
+    password_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        conflicts_with = "bearer_token_file",
+        help = "Bearer token to send in Authorization. Prefer --bearer-token-file to avoid exposing secrets in argv."
+    )]
+    bearer_token: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath,
+        conflicts_with = "bearer_token",
+        help = "Read the bearer token from a file."
+    )]
+    bearer_token_file: Option<PathBuf>,
+
+    #[arg(long = "use-oidc", value_name = "ISSUER", requires = "oidc_client_id")]
+    oidc_issuer_url: Option<String>,
+
+    #[arg(long, value_name = "ID", requires = "oidc_issuer_url")]
+    oidc_client_id: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "SECRET",
+        requires_all = ["oidc_issuer_url", "oidc_client_id"],
+        conflicts_with = "oidc_client_secret_file",
+        help = "OIDC client secret. Prefer --oidc-client-secret-file to avoid exposing secrets in argv."
+    )]
+    oidc_client_secret: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath,
+        requires_all = ["oidc_issuer_url", "oidc_client_id"],
+        conflicts_with = "oidc_client_secret",
+        help = "Read the OIDC client secret from a file."
+    )]
+    oidc_client_secret_file: Option<PathBuf>,
+
+    #[arg(long)]
+    no_pkce: bool,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath,
+        conflicts_with = "insecure"
+    )]
+    ca_cert: Option<PathBuf>,
+
+    #[arg(long, conflicts_with = "ca_cert")]
+    insecure: bool,
+
+    #[arg(value_name = "URL")]
+    url: Uri,
+
+    #[arg(value_name = "COMMAND", trailing_var_arg = true, num_args = 0..)]
+    command: Vec<String>,
 }
 
-fn parse_args() -> Result<Option<(ClientConfig, SessionRequest)>, String> {
-    let mut args = std::env::args();
-    let program = args.next().unwrap_or_else(|| "ssh3-client".to_string());
-    let mut args = args.peekable();
+fn cli_error(kind: ErrorKind, message: impl Into<String>) -> clap::Error {
+    Cli::command().error(kind, message.into())
+}
 
-    let mut server_name: Option<String> = None;
-    let mut username: Option<String> = None;
-    let mut identity_file: Option<PathBuf> = None;
-    let mut agent: Option<AgentSelection> = None;
-    let mut agent_socket: Option<PathBuf> = None;
-    let mut forward_agent = false;
-    let mut password: Option<String> = None;
-    let mut bearer_token: Option<String> = None;
-    let mut oidc_issuer_url: Option<String> = None;
-    let mut oidc_client_id: Option<String> = None;
-    let mut oidc_client_secret: Option<String> = None;
-    let mut oidc_use_pkce = true;
-    let mut ca_cert: Option<PathBuf> = None;
-    let mut insecure = false;
-    let mut url: Option<Uri> = None;
-    let mut command = Vec::new();
+fn read_secret_file(path: &Path, label: &str) -> Result<String, clap::Error> {
+    std::fs::read_to_string(path)
+        .map(|contents| contents.trim_end_matches(['\r', '\n']).to_string())
+        .map_err(|err| cli_error(ErrorKind::Io, format!("failed to read {label}: {err}")))
+}
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--server-name" => {
-                server_name = Some(
-                    args.next()
-                        .ok_or_else(|| "missing value for --server-name".to_string())?,
-                );
-            }
-            "--user" => {
-                username = Some(
-                    args.next()
-                        .ok_or_else(|| "missing value for --user".to_string())?,
-                );
-            }
-            "--identity" => {
-                identity_file = Some(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| "missing value for --identity".to_string())?,
-                ));
-            }
-            "--agent" => {
-                if agent.is_some() {
-                    return Err("use either --agent or --agent-key, not both".to_string());
-                }
-                agent = Some(AgentSelection::First);
-            }
-            "--agent-key" => {
-                if agent.is_some() {
-                    return Err("use either --agent or --agent-key, not both".to_string());
-                }
-                agent = Some(AgentSelection::PublicKey(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| "missing value for --agent-key".to_string())?,
-                )));
-            }
-            "--agent-socket" => {
-                agent_socket =
-                    Some(PathBuf::from(args.next().ok_or_else(|| {
-                        "missing value for --agent-socket".to_string()
-                    })?));
-            }
-            "--forward-agent" => forward_agent = true,
-            "--password" => {
-                password = Some(
-                    args.next()
-                        .ok_or_else(|| "missing value for --password".to_string())?,
-                );
-            }
-            "--password-file" => {
-                let path = PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| "missing value for --password-file".to_string())?,
-                );
-                password = Some(
-                    std::fs::read_to_string(&path)
-                        .map_err(|err| format!("failed to read password file: {err}"))?
-                        .trim_end_matches(['\r', '\n'])
-                        .to_string(),
-                );
-            }
-            "--bearer-token" => {
-                bearer_token = Some(
-                    args.next()
-                        .ok_or_else(|| "missing value for --bearer-token".to_string())?,
-                );
-            }
-            "--bearer-token-file" => {
-                let path = PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| "missing value for --bearer-token-file".to_string())?,
-                );
-                bearer_token = Some(
-                    std::fs::read_to_string(&path)
-                        .map_err(|err| format!("failed to read bearer token file: {err}"))?,
-                );
-            }
-            "--use-oidc" => {
-                oidc_issuer_url = Some(
-                    args.next()
-                        .ok_or_else(|| "missing value for --use-oidc".to_string())?,
-                );
-            }
-            "--oidc-client-id" => {
-                oidc_client_id = Some(
-                    args.next()
-                        .ok_or_else(|| "missing value for --oidc-client-id".to_string())?,
-                );
-            }
-            "--oidc-client-secret" => {
-                oidc_client_secret = Some(
-                    args.next()
-                        .ok_or_else(|| "missing value for --oidc-client-secret".to_string())?,
-                );
-            }
-            "--no-pkce" => oidc_use_pkce = false,
-            "--ca-cert" => {
-                ca_cert = Some(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| "missing value for --ca-cert".to_string())?,
-                ));
-            }
-            "--insecure" => insecure = true,
-            "--help" | "-h" => {
-                println!("{}", usage(&program));
-                return Ok(None);
-            }
-            "--" => {
-                command.extend(args);
-                break;
-            }
-            value if value.starts_with('-') && url.is_none() => {
-                return Err(format!(
-                    "unrecognized argument: {value}\n\n{}",
-                    usage(&program)
-                ));
-            }
-            value if url.is_none() => {
-                url = Some(
-                    value
-                        .parse::<Uri>()
-                        .map_err(|err| format!("invalid URL: {err}"))?,
-                );
-            }
-            value => command.push(value.to_string()),
-        }
-    }
-
-    let Some(url) = url else {
-        return Err(usage(&program));
+fn build_config(cli: Cli) -> Result<(ClientConfig, SessionRequest), clap::Error> {
+    let mut config = ClientConfig::new(cli.url);
+    config.server_name = cli.server_name;
+    config.username = cli.user;
+    config.identity_file = cli.identity;
+    config.agent = if cli.agent {
+        Some(AgentSelection::First)
+    } else {
+        cli.agent_key.map(AgentSelection::PublicKey)
     };
-    if insecure && ca_cert.is_some() {
-        return Err("use either --ca-cert or --insecure, not both".to_string());
-    }
-    let has_oidc_client_secret = oidc_client_secret.is_some();
-    let oidc = match (oidc_issuer_url, oidc_client_id) {
+    config.agent_socket = cli.agent_socket;
+    config.forward_agent = cli.forward_agent;
+    config.password = match (cli.password, cli.password_file) {
+        (Some(password), None) => Some(password),
+        (None, Some(path)) => Some(read_secret_file(&path, "password file")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap enforces password conflicts"),
+    };
+    config.bearer_token = match (cli.bearer_token, cli.bearer_token_file) {
+        (Some(token), None) => Some(token.trim().to_string()),
+        (None, Some(path)) => Some(read_secret_file(&path, "bearer token file")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap enforces bearer token conflicts"),
+    };
+    config.oidc = match (cli.oidc_issuer_url, cli.oidc_client_id) {
         (Some(issuer_url), Some(client_id)) => Some(OidcConfig {
             issuer_url,
             client_id,
-            client_secret: oidc_client_secret,
-            use_pkce: oidc_use_pkce,
+            client_secret: match (cli.oidc_client_secret, cli.oidc_client_secret_file) {
+                (Some(secret), None) => Some(secret),
+                (None, Some(path)) => Some(read_secret_file(&path, "OIDC client secret file")?),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("clap enforces OIDC secret conflicts"),
+            },
+            use_pkce: !cli.no_pkce,
         }),
         (None, None) => None,
-        (Some(_), None) => {
-            return Err("--use-oidc requires --oidc-client-id".to_string());
-        }
-        (None, Some(_)) => {
-            return Err("--oidc-client-id requires --use-oidc".to_string());
-        }
+        (Some(_), None) | (None, Some(_)) => unreachable!("clap enforces OIDC requirements"),
     };
-    if oidc.is_none() && has_oidc_client_secret {
-        return Err("--oidc-client-secret requires --use-oidc".to_string());
-    }
-
-    let auth_methods = usize::from(identity_file.is_some())
-        + usize::from(agent.is_some())
-        + usize::from(password.is_some())
-        + usize::from(bearer_token.is_some())
-        + usize::from(oidc.is_some());
-    if auth_methods > 1 {
-        return Err(
-            "use either --identity, --agent/--agent-key, --password/--password-file, --bearer-token/--bearer-token-file, or --use-oidc".to_string(),
-        );
-    }
-    if agent.is_some() && username.is_none() {
-        return Err("--agent/--agent-key requires --user".to_string());
-    }
-    if password.is_some() && username.is_none() {
-        return Err("--password/--password-file requires --user".to_string());
-    }
-
-    let mut config = ClientConfig::new(url);
-    config.server_name = server_name;
-    config.username = username;
-    config.identity_file = identity_file;
-    config.agent = agent;
-    config.agent_socket = agent_socket;
-    config.forward_agent = forward_agent;
-    config.password = password;
-    config.bearer_token = bearer_token.map(|token| token.trim().to_string());
-    config.oidc = oidc;
-    config.trust = if insecure {
+    config.trust = if cli.insecure {
         TrustStrategy::Insecure
-    } else if let Some(path) = ca_cert {
-        TrustStrategy::Certificates(
-            load_certificates(&path)
-                .map_err(|err| format!("failed to load CA certificate: {err}"))?,
-        )
+    } else if let Some(path) = cli.ca_cert {
+        TrustStrategy::Certificates(load_certificates(&path).map_err(|err| {
+            cli_error(
+                ErrorKind::ValueValidation,
+                format!("failed to load CA certificate: {err}"),
+            )
+        })?)
     } else {
         TrustStrategy::WebPkiRoots
     };
 
-    let request = if command.is_empty() {
+    let request = if cli.command.is_empty() {
         SessionRequest::Shell
     } else {
-        SessionRequest::Exec(command.join(" "))
+        SessionRequest::Exec(cli.command.join(" "))
     };
-    Ok(Some((config, request)))
+    Ok((config, request))
+}
+
+fn parse_args() -> Result<(ClientConfig, SessionRequest), clap::Error> {
+    build_config(Cli::try_parse()?)
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let (config, request) = match parse_args() {
-        Ok(Some(parsed)) => parsed,
-        Ok(None) => return ExitCode::SUCCESS,
+        Ok(parsed) => parsed,
         Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::FAILURE;
+            let status = match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            };
+            err.print().ok();
+            return status;
         }
     };
 
@@ -253,5 +232,74 @@ async fn main() -> ExitCode {
             eprintln!("ssh3-client failed: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, build_config};
+    use clap::{Parser, error::ErrorKind};
+
+    #[test]
+    fn password_file_is_loaded_and_trimmed() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let password_file = tempdir.path().join("password.txt");
+        std::fs::write(&password_file, "secret-password\n").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "ssh3-client",
+            "--user",
+            "alice",
+            "--password-file",
+            password_file.to_str().unwrap(),
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        let (config, _) = build_config(cli).unwrap();
+
+        assert_eq!(config.password.as_deref(), Some("secret-password"));
+    }
+
+    #[test]
+    fn oidc_client_secret_file_is_loaded_and_trimmed() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let secret_file = tempdir.path().join("oidc-secret.txt");
+        std::fs::write(&secret_file, "client-secret\r\n").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "ssh3-client",
+            "--use-oidc",
+            "https://issuer.example",
+            "--oidc-client-id",
+            "client-id",
+            "--oidc-client-secret-file",
+            secret_file.to_str().unwrap(),
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap();
+        let (config, _) = build_config(cli).unwrap();
+
+        assert_eq!(
+            config
+                .oidc
+                .as_ref()
+                .and_then(|oidc| oidc.client_secret.as_deref()),
+            Some("client-secret")
+        );
+    }
+
+    #[test]
+    fn clap_rejects_multiple_auth_methods() {
+        let err = Cli::try_parse_from([
+            "ssh3-client",
+            "--identity",
+            "/tmp/id",
+            "--bearer-token-file",
+            "/tmp/token",
+            "https://localhost:4433/ssh3-term",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 }
