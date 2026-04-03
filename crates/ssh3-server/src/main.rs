@@ -54,7 +54,9 @@ fn parse_args() -> Result<ServerConfig, clap::Error> {
     if let Some(server_header) = cli.server_header {
         config.server_header = server_header;
     }
-    config.require_authentication = cli.require_auth;
+    if cli.require_auth {
+        config.require_authentication = true;
+    }
     config.enable_password_login = cli.enable_password_login;
     if !cli.authorized_identity.is_empty() {
         config.authorized_identity_paths = cli.authorized_identity;

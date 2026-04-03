@@ -17,6 +17,32 @@ type User struct {
 	Shell    string
 }
 
+func applyCurrentProcessOverrides(username string, user *User) *User {
+	if user == nil {
+		return nil
+	}
+
+	currentUsername := os.Getenv("USER")
+	if currentUsername == "" {
+		currentUsername = os.Getenv("LOGNAME")
+	}
+	if currentUsername == "" || currentUsername != username {
+		return user
+	}
+
+	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
+		user.Dir = homeDir
+	} else if homeDir := os.Getenv("HOME"); homeDir != "" {
+		user.Dir = homeDir
+	}
+
+	if shell := os.Getenv("SHELL"); shell != "" {
+		user.Shell = shell
+	}
+
+	return user
+}
+
 func GetUser(username string) (*User, error) {
 	return getUser(username)
 }

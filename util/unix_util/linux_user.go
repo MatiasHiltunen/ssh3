@@ -59,7 +59,7 @@ func Getspnam(name string) (*ShadowEntry, error) {
 		Password: C.GoString(cspwd.sp_pwdp),
 	}
 
-	return &s, nil
+	return applyCurrentProcessOverrides(username, &s), nil
 }
 
 /*

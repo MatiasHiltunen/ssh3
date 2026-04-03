@@ -250,6 +250,11 @@ pub enum ClientError {
     AgentKeyNotFound,
     UnsupportedAgentKey(String),
     ConflictingAuthenticationMethods,
+    ChannelRequestFailed(&'static str),
+    UnexpectedChannelReply {
+        request: &'static str,
+        message: Message,
+    },
     ExitSignal(ExitSignalRequest),
 }
 
@@ -295,6 +300,12 @@ impl fmt::Display for ClientError {
                 f,
                 "configure only one of: identity file, SSH agent, password, raw bearer token, or OIDC"
             ),
+            Self::ChannelRequestFailed(request) => {
+                write!(f, "{request} request was rejected by the server")
+            }
+            Self::UnexpectedChannelReply { request, message } => {
+                write!(f, "unexpected reply to {request} request: {message:?}")
+            }
             Self::ExitSignal(signal) => write!(
                 f,
                 "remote process exited with signal {}: {}",
@@ -333,6 +344,8 @@ impl std::error::Error for ClientError {
             Self::AgentKeyNotFound => None,
             Self::UnsupportedAgentKey(_) => None,
             Self::ConflictingAuthenticationMethods => None,
+            Self::ChannelRequestFailed(_) => None,
+            Self::UnexpectedChannelReply { .. } => None,
             Self::ExitSignal(_) => None,
         }
     }
@@ -492,18 +505,56 @@ async fn send_initial_session_requests(
             }),
         },
     };
+    let request_name = request_name(&request);
+    send_request_expect_reply(channel, request, request_name).await
+}
+
+fn request_name(request: &ChannelRequestMessage) -> &'static str {
+    match &request.request {
+        ChannelRequest::Pty(_) => "pty",
+        ChannelRequest::X11(_) => "x11",
+        ChannelRequest::Shell => "shell",
+        ChannelRequest::Exec(_) => "exec",
+        ChannelRequest::Subsystem(_) => "subsystem",
+        ChannelRequest::WindowChange(_) => "window-change",
+        ChannelRequest::Signal(_) => "signal",
+        ChannelRequest::ExitStatus(_) => "exit-status",
+        ChannelRequest::ExitSignal(_) => "exit-signal",
+        ChannelRequest::ForwardPort(_) => "forward-port",
+    }
+}
+
+async fn send_request_expect_reply(
+    channel: &Channel,
+    request: ChannelRequestMessage,
+    request_name: &'static str,
+) -> Result<(), ClientError> {
+    let want_reply = request.want_reply;
     channel
         .send_request(request)
         .await
-        .map_err(ClientError::from)
+        .map_err(ClientError::from)?;
+    if !want_reply {
+        return Ok(());
+    }
+
+    match channel.next_message().await.map_err(ClientError::from)? {
+        Message::ChannelSuccess => Ok(()),
+        Message::ChannelFailure => Err(ClientError::ChannelRequestFailed(request_name)),
+        message => Err(ClientError::UnexpectedChannelReply {
+            request: request_name,
+            message,
+        }),
+    }
 }
 
 async fn send_pty_request(
     channel: &Channel,
     terminal: &LocalTerminalInfo,
 ) -> Result<(), ClientError> {
-    channel
-        .send_request(ChannelRequestMessage {
+    send_request_expect_reply(
+        channel,
+        ChannelRequestMessage {
             want_reply: true,
             request: ChannelRequest::Pty(PtyRequest {
                 term: terminal.term.clone().unwrap_or_default().into_bytes(),
@@ -513,9 +564,10 @@ async fn send_pty_request(
                 pixel_height: terminal.size.pixel_height.into(),
                 encoded_terminal_modes: Vec::new(),
             }),
-        })
-        .await
-        .map_err(ClientError::from)
+        },
+        "pty",
+    )
+    .await
 }
 
 async fn send_forward_agent_request(channel: &Channel) -> Result<(), ClientError> {
@@ -829,51 +881,49 @@ async fn wait_for_oidc_callback(
         )
     }
 
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        let request = read_http_request(&mut stream).await?;
-        let target = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .ok_or(OidcError::InvalidResponse(
-                "malformed OIDC callback request",
-            ))?;
-        let callback_url = Url::parse(&format!("http://localhost{target}"))?;
-        let mut code = None;
-        let mut state = None;
-        let mut provider_error = None;
-        for (key, value) in callback_url.query_pairs() {
-            match key.as_ref() {
-                "code" => code = Some(value.into_owned()),
-                "state" => state = Some(value.into_owned()),
-                "error" => provider_error = Some(value.into_owned()),
-                _ => {}
-            }
+    let (mut stream, _) = listener.accept().await?;
+    let request = read_http_request(&mut stream).await?;
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or(OidcError::InvalidResponse(
+            "malformed OIDC callback request",
+        ))?;
+    let callback_url = Url::parse(&format!("http://localhost{target}"))?;
+    let mut code = None;
+    let mut state = None;
+    let mut provider_error = None;
+    for (key, value) in callback_url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            "error" => provider_error = Some(value.into_owned()),
+            _ => {}
         }
-
-        if let Some(provider_error) = provider_error {
-            let response =
-                callback_response("HTTP/1.1 400 Bad Request", "OIDC authentication failed.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::ProviderError(provider_error));
-        }
-        if state.as_deref() != Some(expected_state) {
-            let response = callback_response("HTTP/1.1 400 Bad Request", "OIDC state mismatch.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::InvalidResponse("OIDC state mismatch"));
-        }
-        let Some(code) = code else {
-            let response =
-                callback_response("HTTP/1.1 400 Bad Request", "OIDC callback missing code.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::InvalidResponse("OIDC callback missing code"));
-        };
-
-        let response = callback_response("HTTP/1.1 200 OK", "you can now close this tab");
-        let _ = stream.write_all(response.as_bytes()).await;
-        return Ok(code);
     }
+
+    if let Some(provider_error) = provider_error {
+        let response =
+            callback_response("HTTP/1.1 400 Bad Request", "OIDC authentication failed.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(OidcError::ProviderError(provider_error));
+    }
+    if state.as_deref() != Some(expected_state) {
+        let response = callback_response("HTTP/1.1 400 Bad Request", "OIDC state mismatch.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(OidcError::InvalidResponse("OIDC state mismatch"));
+    }
+    let Some(code) = code else {
+        let response =
+            callback_response("HTTP/1.1 400 Bad Request", "OIDC callback missing code.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(OidcError::InvalidResponse("OIDC callback missing code"));
+    };
+
+    let response = callback_response("HTTP/1.1 200 OK", "you can now close this tab");
+    let _ = stream.write_all(response.as_bytes()).await;
+    Ok(code)
 }
 
 async fn exchange_oidc_code(
@@ -1226,7 +1276,7 @@ async fn run_capture_on_client(
     let session_runtime = build_session_runtime(client, config, channel.clone(), &request, None)?;
     send_initial_session_requests(channel.as_ref(), &request, None).await?;
     if !config.forward_agent {
-        channel.close().await?;
+        channel.send_eof().await?;
     }
 
     let mut stdout = Vec::new();
@@ -1293,7 +1343,7 @@ async fn run_stdio_on_client(
                     Err(_) => return,
                 };
                 if n == 0 {
-                    let _ = channel.close().await;
+                    let _ = channel.send_eof().await;
                     return;
                 }
                 if channel
@@ -1450,15 +1500,17 @@ async fn forward_agent_channel(
         async move {
             loop {
                 let message = channel.next_message().await?;
-                if let Message::Data(data) = message
-                    && data.data_type == SSH_EXTENDED_DATA_NONE
-                {
-                    writer.write_all(&data.data).await?;
-                    writer.flush().await?;
+                match message {
+                    Message::Data(data) if data.data_type == SSH_EXTENDED_DATA_NONE => {
+                        writer.write_all(&data.data).await?;
+                        writer.flush().await?;
+                    }
+                    Message::ChannelEof | Message::ChannelClose => {
+                        return Ok::<(), ClientError>(());
+                    }
+                    _ => {}
                 }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), ClientError>(())
         }
     });
 
@@ -1474,7 +1526,7 @@ async fn forward_agent_channel(
             loop {
                 let n = reader.read(&mut buf).await?;
                 if n == 0 {
-                    let _ = channel.close().await;
+                    let _ = channel.send_eof().await;
                     return Ok::<(), ClientError>(());
                 }
                 channel
@@ -1547,7 +1599,7 @@ mod tests {
         accept_bi_channel, open_tcp_forwarding_channel, open_udp_forwarding_channel,
         self_signed_server_config,
     };
-    use ssh3_server::{ServerConfig, serve_connection};
+    use ssh3_server::{PasswordVerifier, ServerConfig, serve_connection};
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     #[cfg(unix)]
@@ -1569,8 +1621,54 @@ mod tests {
         send_initial_session_requests, send_signal_request, send_window_change_request,
     };
 
+    fn unauthenticated_server_config() -> ServerConfig {
+        ServerConfig {
+            require_authentication: false,
+            ..ServerConfig::default()
+        }
+    }
+
+    fn authenticated_server_config(authorized_identity_path: PathBuf) -> ServerConfig {
+        ServerConfig {
+            authorized_identity_paths: vec![authorized_identity_path],
+            default_user: Some("does-not-exist".to_string()),
+            ..ServerConfig::default()
+        }
+    }
+
+    fn password_login_server_config(password_verifier: PasswordVerifier) -> ServerConfig {
+        ServerConfig {
+            enable_password_login: true,
+            default_user: Some("does-not-exist".to_string()),
+            password_verifier: Some(password_verifier),
+            ..ServerConfig::default()
+        }
+    }
+
+    fn local_test_target(server_port: u16) -> String {
+        format!("https://127.0.0.1:{server_port}/ssh3-term")
+    }
+
+    fn local_go_cli_target(username: &str, server_port: u16) -> String {
+        format!("{username}@127.0.0.1:{server_port}/ssh3-term")
+    }
+
+    fn local_certificate_client_config(server_port: u16, trust: TrustStrategy) -> ClientConfig {
+        let mut config = ClientConfig::new(local_test_target(server_port).parse().unwrap());
+        config.server_name = Some("localhost".to_string());
+        config.trust = trust;
+        config
+    }
+
     async fn setup_request_capture_harness(
         expected_messages: usize,
+    ) -> (super::ActiveClient, tokio::task::JoinHandle<Vec<Message>>) {
+        setup_request_capture_harness_with_replies(expected_messages, Vec::new()).await
+    }
+
+    async fn setup_request_capture_harness_with_replies(
+        expected_messages: usize,
+        replies: Vec<Message>,
     ) -> (super::ActiveClient, tokio::task::JoinHandle<Vec<Message>>) {
         let (server_config, server_certificate) =
             self_signed_server_config(vec!["localhost".to_string()]).unwrap();
@@ -1582,6 +1680,7 @@ mod tests {
         let server_addr = server_endpoint.local_addr().unwrap();
 
         let server_task = tokio::spawn(async move {
+            let mut replies = replies.into_iter();
             let incoming = timeout(Duration::from_secs(5), server_endpoint.accept())
                 .await
                 .unwrap()
@@ -1620,22 +1719,28 @@ mod tests {
 
             let mut messages = Vec::new();
             for _ in 0..expected_messages {
-                messages.push(
-                    timeout(Duration::from_secs(5), channel.next_message())
+                let message = timeout(Duration::from_secs(5), channel.next_message())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let Message::ChannelRequest(request) = &message
+                    && request.want_reply
+                {
+                    channel
+                        .send_message(replies.next().unwrap_or(Message::ChannelSuccess))
                         .await
-                        .unwrap()
-                        .unwrap(),
-                );
+                        .unwrap();
+                }
+                messages.push(message);
             }
+            let _ = timeout(Duration::from_secs(5), connection.closed()).await;
             messages
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         let client = connect_client(&config).await.unwrap();
         (client, server_task)
     }
@@ -1691,6 +1796,20 @@ mod tests {
             config.max_packet_size,
             config.default_datagrams_queue_size,
         ))
+    }
+
+    async fn wait_for_exit_status(channel: &Arc<Channel>) -> u64 {
+        loop {
+            if let Message::ChannelRequest(message) = channel.next_message().await.unwrap() {
+                match message.request {
+                    ChannelRequest::ExitStatus(status) => return status.exit_status,
+                    ChannelRequest::ExitSignal(signal) => {
+                        panic!("unexpected exit signal: {signal:?}")
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -2323,10 +2442,7 @@ mod tests {
         parts.extend(command.iter().map(|arg| shell_quote(arg)));
         let command = parts.join(" ");
 
-        let mut child = TokioCommand::new("script")
-            .arg("-qefc")
-            .arg(command)
-            .arg("/dev/null")
+        let mut child = new_script_command(&command)
             .env("HOME", home_dir)
             .env("TERM", "xterm")
             .stdin(Stdio::piped())
@@ -2352,6 +2468,21 @@ mod tests {
     #[cfg(unix)]
     fn shell_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(unix)]
+    fn new_script_command(command: &str) -> TokioCommand {
+        let mut script = TokioCommand::new("script");
+        #[cfg(target_os = "macos")]
+        script
+            .arg("-q")
+            .arg("/dev/null")
+            .arg("sh")
+            .arg("-lc")
+            .arg(command);
+        #[cfg(not(target_os = "macos"))]
+        script.arg("-qefc").arg(command).arg("/dev/null");
+        script
     }
 
     #[cfg(unix)]
@@ -2489,7 +2620,7 @@ mod tests {
                 if nix::libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY, 0) == -1 {
+                if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY.into(), 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -2532,38 +2663,20 @@ mod tests {
         private_key_path: &Path,
         input: &str,
     ) -> std::process::Output {
-        let binaries = go_cli_binaries();
-        fs::create_dir_all(home_dir.join(".ssh")).unwrap();
-        fs::create_dir_all(home_dir.join(".ssh3")).unwrap();
-
-        let command = format!(
-            "{} -insecure -privkey {} {}",
-            shell_quote(binaries.client.to_string_lossy().as_ref()),
-            shell_quote(private_key_path.to_string_lossy().as_ref()),
-            shell_quote(url),
-        );
-
-        let mut child = TokioCommand::new("script")
-            .arg("-qefc")
-            .arg(command)
-            .arg("/dev/null")
-            .env("HOME", home_dir)
-            .env("TERM", "xterm")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(input.as_bytes()).await.unwrap();
-        drop(stdin);
-
-        timeout(Duration::from_secs(20), child.wait_with_output())
-            .await
-            .unwrap()
-            .unwrap()
+        let session = spawn_go_cli_shell_with_pty(
+            home_dir,
+            url,
+            private_key_path,
+            TerminalSize {
+                char_width: 80,
+                char_height: 24,
+                pixel_width: 640,
+                pixel_height: 480,
+            },
+        )
+        .await;
+        session.write_all(input).await;
+        session.wait_with_output().await
     }
 
     async fn run_shell_capture_with_resize_on_client(
@@ -2726,16 +2839,14 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn go_binary_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn go_binary_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[cfg(unix)]
-    fn lock_go_binary_tests() -> std::sync::MutexGuard<'static, ()> {
-        go_binary_test_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    async fn lock_go_binary_tests() -> tokio::sync::MutexGuard<'static, ()> {
+        go_binary_test_lock().lock().await
     }
 
     #[cfg(unix)]
@@ -3477,19 +3588,17 @@ mod tests {
                 .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                serve_connection(connection, ServerConfig::default()),
+                serve_connection(connection, unauthenticated_server_config()),
             )
             .await
             .unwrap()
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
 
         let session = tokio::time::timeout(
             Duration::from_secs(10),
@@ -3515,7 +3624,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_exec_capture_round_trips_against_the_go_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
         let cert_path = tempdir.path().join("cert.pem");
@@ -3564,7 +3673,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_exec_capture_round_trips_against_the_real_go_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
         let home_dir = tempdir.path().join("home");
@@ -3629,7 +3738,7 @@ mod tests {
     #[tokio::test]
     async fn rust_client_exec_capture_round_trips_with_extra_pubkey_algorithms_against_the_real_go_server()
      {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
 
         for (algorithm, label) in [
             (AuthKeyAlgorithm::NistP256, "p256"),
@@ -3704,7 +3813,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_exec_round_trips_with_oidc_against_the_real_go_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_oidc_fixture().await;
         let tempdir = TempDir::new().unwrap();
         let home_dir = tempdir.path().join("home");
@@ -3802,19 +3911,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.identity_file = Some(private_key_path);
 
@@ -3868,19 +3972,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.identity_file = Some(private_key_path);
 
@@ -3934,10 +4033,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             tokio::time::timeout(
                 Duration::from_secs(10),
                 serve_connection(connection, config),
@@ -3947,12 +4043,10 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.identity_file = Some(private_key_path);
 
@@ -3980,7 +4074,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn go_client_exec_round_trips_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -4003,10 +4097,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             tokio::time::timeout(
                 Duration::from_secs(10),
                 serve_connection(connection, config),
@@ -4017,7 +4108,7 @@ mod tests {
         });
 
         let output = run_go_interop_client(
-            &format!("https://localhost:{}/ssh3-term", server_addr.port()),
+            &local_test_target(server_addr.port()),
             &username,
             &private_key_path,
             "printf 'hello from go to rust\\n'",
@@ -4036,7 +4127,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_exec_round_trips_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -4059,17 +4150,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
         let tempdir = TempDir::new().unwrap();
         let output = run_go_cli_client(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &private_key_path,
             &["echo", "hello from real go cli"],
         )
@@ -4093,7 +4181,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_exec_round_trips_with_oidc_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_oidc_fixture().await;
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -4117,10 +4205,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
@@ -4136,7 +4221,7 @@ mod tests {
 
         let output = run_go_cli_client_with_oidc(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &issuer_url,
             &oidc_config_path,
             &["echo", "hello from real go oidc"],
@@ -4162,7 +4247,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_exec_round_trips_with_password_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let username = current_username();
         let password = "correct horse battery staple".to_string();
         let expected_username = username.clone();
@@ -4185,21 +4270,19 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.enable_password_login = true;
-            config.password_verifier =
-                Some(Arc::new(move |candidate_username, candidate_password| {
+            let config = password_login_server_config(Arc::new(
+                move |candidate_username, candidate_password| {
                     Ok(candidate_username == expected_username
                         && candidate_password == expected_password)
-                }));
-            config.default_user = Some("does-not-exist".to_string());
+                },
+            ));
             serve_connection(connection, config).await.unwrap();
         });
 
         let tempdir = TempDir::new().unwrap();
         let output = run_go_cli_client_with_password(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &password,
             &["echo", "hello from real go password"],
         )
@@ -4224,7 +4307,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_shell_with_pty_round_trips_against_the_real_go_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
         let home_dir = tempdir.path().join("home");
@@ -4315,7 +4398,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_shell_with_pty_round_trips_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -4338,17 +4421,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
         let tempdir = TempDir::new().unwrap();
         let output = run_go_cli_shell(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &private_key_path,
             "printf '__SSH3_PTY_GO_CLIENT_OK__:%s\\n' \"$TERM\"\nexit\n",
         )
@@ -4375,7 +4455,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_window_change_round_trips_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -4398,17 +4478,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
         let tempdir = TempDir::new().unwrap();
         let session = spawn_go_cli_shell_with_pty(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &private_key_path,
             TerminalSize {
                 char_width: 80,
@@ -4450,7 +4527,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_signal_round_trips_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -4473,17 +4550,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
         let tempdir = TempDir::new().unwrap();
         let session = spawn_go_cli_shell_with_pty(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &private_key_path,
             TerminalSize {
                 char_width: 80,
@@ -4521,7 +4595,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_tcp_forwarding_round_trips_against_the_real_go_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
         let home_dir = tempdir.path().join("home");
@@ -4582,7 +4656,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_tcp_forwarding_round_trips_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -4606,10 +4680,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
@@ -4618,7 +4689,7 @@ mod tests {
         let log_path = tempdir.path().join("go-client-forward.log");
         let mut forwarder = spawn_go_cli_tcp_forwarder(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &private_key_path,
             local_port,
             remote_addr,
@@ -4661,7 +4732,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_udp_forwarding_round_trips_against_the_real_go_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
         let home_dir = tempdir.path().join("home");
@@ -4722,7 +4793,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_udp_forwarding_round_trips_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let authorized_identities_path = fixture.authorized_identities_path.clone();
         let username = fixture.username.clone();
@@ -4746,10 +4817,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
@@ -4758,7 +4826,7 @@ mod tests {
         let log_path = tempdir.path().join("go-client-forward.log");
         let mut forwarder = spawn_go_cli_udp_forwarder(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &private_key_path,
             local_port,
             remote_addr,
@@ -4827,10 +4895,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             tokio::time::timeout(
                 Duration::from_secs(10),
                 serve_connection(connection, config),
@@ -4840,12 +4905,10 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.agent = Some(super::AgentSelection::First);
         config.agent_socket = Some(agent.socket_path.clone());
@@ -4899,10 +4962,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             tokio::time::timeout(
                 Duration::from_secs(10),
                 serve_connection(connection, config),
@@ -4912,12 +4972,10 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.agent = Some(super::AgentSelection::PublicKey(private_key_path));
         config.agent_socket = Some(agent.socket_path.clone());
@@ -4968,19 +5026,17 @@ mod tests {
                 .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                serve_connection(connection, ServerConfig::default()),
+                serve_connection(connection, unauthenticated_server_config()),
             )
             .await
             .unwrap()
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.forward_agent = true;
         config.agent_socket = Some(agent.socket_path.clone());
 
@@ -5007,21 +5063,7 @@ mod tests {
         assert!(!signature.is_empty());
         assert_eq!(agent.sign_flags(), vec![0]);
 
-        loop {
-            match channel.next_message().await.unwrap() {
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(status) => {
-                        assert_eq!(status.exit_status, 0);
-                        break;
-                    }
-                    ChannelRequest::ExitSignal(signal) => {
-                        panic!("unexpected exit signal: {signal:?}")
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
+        assert_eq!(wait_for_exit_status(&channel).await, 0);
 
         drop(session_runtime);
         client.shutdown().await;
@@ -5052,19 +5094,17 @@ mod tests {
                 .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                serve_connection(connection, ServerConfig::default()),
+                serve_connection(connection, unauthenticated_server_config()),
             )
             .await
             .unwrap()
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.forward_agent = true;
         config.agent_socket = Some(agent.socket_path.clone());
 
@@ -5098,21 +5138,7 @@ mod tests {
         assert_ne!(first_signature, second_signature);
         assert_eq!(agent.sign_flags(), vec![0, 0]);
 
-        loop {
-            match channel.next_message().await.unwrap() {
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(status) => {
-                        assert_eq!(status.exit_status, 0);
-                        break;
-                    }
-                    ChannelRequest::ExitSignal(signal) => {
-                        panic!("unexpected exit signal: {signal:?}")
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
+        assert_eq!(wait_for_exit_status(&channel).await, 0);
 
         drop(session_runtime);
         client.shutdown().await;
@@ -5122,7 +5148,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rust_client_forward_agent_round_trips_against_the_real_go_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
         let tempdir = TempDir::new().unwrap();
@@ -5199,21 +5225,7 @@ mod tests {
         assert!(!signature.is_empty());
         assert_eq!(agent.sign_flags(), vec![0]);
 
-        loop {
-            match channel.next_message().await.unwrap() {
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(status) => {
-                        assert_eq!(status.exit_status, 0);
-                        break;
-                    }
-                    ChannelRequest::ExitSignal(signal) => {
-                        panic!("unexpected exit signal: {signal:?}")
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
+        assert_eq!(wait_for_exit_status(&channel).await, 0);
 
         drop(session_runtime);
         client.shutdown().await;
@@ -5224,7 +5236,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn go_agent_probe_talks_to_mock_agent_locally() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
         let probe = go_agent_probe_binary();
 
@@ -5253,7 +5265,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_go_client_forward_agent_round_trips_against_the_rust_server() {
-        let _guard = lock_go_binary_tests();
+        let _guard = lock_go_binary_tests().await;
         let agent = spawn_mock_agent(auth_private_key(AuthKeyAlgorithm::Ed25519)).await;
         let probe = go_agent_probe_binary();
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
@@ -5278,17 +5290,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             serve_connection(connection, config).await.unwrap();
         });
 
         let tempdir = TempDir::new().unwrap();
         let output = run_go_cli_client_with_forwarded_agent(
             tempdir.path(),
-            &format!("{}@localhost:{}/ssh3-term", username, server_addr.port()),
+            &local_go_cli_target(&username, server_addr.port()),
             &private_key_path,
             agent.socket_path.as_path(),
             &[probe.path.to_string_lossy().as_ref()],
@@ -5338,10 +5347,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             tokio::time::timeout(
                 Duration::from_secs(10),
                 serve_connection(connection, config),
@@ -5351,12 +5357,10 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         let client = connect_client_with_authorization_builder(&config, |conversation_id| {
             bearer_authorization_value(
@@ -5416,10 +5420,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.require_authentication = true;
-            config.authorized_identity_paths = vec![authorized_identities_path.clone()];
-            config.default_user = Some("does-not-exist".to_string());
+            let config = authenticated_server_config(authorized_identities_path.clone());
             tokio::time::timeout(
                 Duration::from_secs(10),
                 serve_connection(connection, config),
@@ -5429,12 +5430,10 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.oidc = Some(OidcConfig {
             issuer_url,
@@ -5501,14 +5500,12 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut config = ServerConfig::default();
-            config.enable_password_login = true;
-            config.default_user = Some("does-not-exist".to_string());
-            config.password_verifier =
-                Some(Arc::new(move |candidate_username, candidate_password| {
+            let config = password_login_server_config(Arc::new(
+                move |candidate_username, candidate_password| {
                     Ok(candidate_username == expected_username
                         && candidate_password == expected_password)
-                }));
+                },
+            ));
             tokio::time::timeout(
                 Duration::from_secs(10),
                 serve_connection(connection, config),
@@ -5518,12 +5515,10 @@ mod tests {
             .unwrap();
         });
 
-        let mut config = ClientConfig::new(
-            format!("https://localhost:{}/ssh3-term", server_addr.port())
-                .parse()
-                .unwrap(),
+        let mut config = local_certificate_client_config(
+            server_addr.port(),
+            TrustStrategy::Certificates(vec![server_certificate]),
         );
-        config.trust = TrustStrategy::Certificates(vec![server_certificate]);
         config.username = Some(username);
         config.password = Some(password);
 
@@ -5568,6 +5563,7 @@ mod tests {
         .await
         .unwrap();
 
+        client.shutdown().await;
         let messages = server_task.await.unwrap();
         match &messages[0] {
             Message::ChannelRequest(message) => match &message.request {
@@ -5588,8 +5584,67 @@ mod tests {
             }
             other => panic!("expected channel request, got {other:?}"),
         }
+    }
 
+    #[tokio::test]
+    async fn exec_requests_fail_when_the_server_replies_with_channel_failure() {
+        let (client, server_task) =
+            setup_request_capture_harness_with_replies(1, vec![Message::ChannelFailure]).await;
+        let channel = client.open_session_channel().await.unwrap();
+
+        let err = send_initial_session_requests(
+            channel.as_ref(),
+            &SessionRequest::Exec("printf 'nope\\n'".to_string()),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ClientError::ChannelRequestFailed("exec")));
         client.shutdown().await;
+        let messages = server_task.await.unwrap();
+        assert!(matches!(
+            &messages[0],
+            Message::ChannelRequest(message) if matches!(message.request, ChannelRequest::Exec(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn shell_requests_fail_when_the_server_closes_the_channel_during_pty_setup() {
+        let (client, server_task) =
+            setup_request_capture_harness_with_replies(1, vec![Message::ChannelClose]).await;
+        let channel = client.open_session_channel().await.unwrap();
+
+        let err = send_initial_session_requests(
+            channel.as_ref(),
+            &SessionRequest::Shell,
+            Some(&LocalTerminalInfo {
+                term: Some("xterm-256color".to_string()),
+                size: TerminalSize {
+                    char_width: 80,
+                    char_height: 24,
+                    pixel_width: 640,
+                    pixel_height: 480,
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            ClientError::UnexpectedChannelReply {
+                request: "pty",
+                message: Message::ChannelClose,
+            } => {}
+            other => panic!("expected unexpected channel close, got {other:?}"),
+        }
+        client.shutdown().await;
+        let messages = server_task.await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            Message::ChannelRequest(message) if matches!(message.request, ChannelRequest::Pty(_))
+        ));
     }
 
     #[tokio::test]
@@ -5608,6 +5663,7 @@ mod tests {
         .await
         .unwrap();
 
+        client.shutdown().await;
         let messages = server_task.await.unwrap();
         match &messages[0] {
             Message::ChannelRequest(message) => match &message.request {
@@ -5619,8 +5675,6 @@ mod tests {
             },
             other => panic!("expected channel request, got {other:?}"),
         }
-
-        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -5629,6 +5683,7 @@ mod tests {
         let channel = client.open_session_channel().await.unwrap();
         send_signal_request(channel.as_ref(), "TERM").await.unwrap();
 
+        client.shutdown().await;
         let messages = server_task.await.unwrap();
         match &messages[0] {
             Message::ChannelRequest(message) => match &message.request {
@@ -5639,7 +5694,5 @@ mod tests {
             },
             other => panic!("expected channel request, got {other:?}"),
         }
-
-        client.shutdown().await;
     }
 }

@@ -58,7 +58,6 @@ pub fn build_agent_bearer_token(
                 jwt_signature_from_agent_signature(jwt_algorithm, &signature)
             },
         )
-        .map_err(ClientError::from)
     }
 
     #[cfg(not(unix))]

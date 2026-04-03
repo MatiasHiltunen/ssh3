@@ -78,6 +78,9 @@ type Channel interface {
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
 	SendDatagram(datagram []byte) error
 	SendRequest(r *ssh3.ChannelRequestMessage) error
+	SendRequestSuccess() error
+	SendRequestFailure() error
+	SendEOF() error
 	CancelRead()
 	Close()
 	MaxPacketSize() uint64
@@ -386,6 +389,18 @@ func (c *channelImpl) SendDatagram(datagram []byte) error {
 func (c *channelImpl) SendRequest(r *ssh3.ChannelRequestMessage) error {
 	//TODO: make it thread safe
 	return c.sendMessage(r)
+}
+
+func (c *channelImpl) SendRequestSuccess() error {
+	return c.sendMessage(&ssh3.ChannelSuccessMessage{})
+}
+
+func (c *channelImpl) SendRequestFailure() error {
+	return c.sendMessage(&ssh3.ChannelFailureMessage{})
+}
+
+func (c *channelImpl) SendEOF() error {
+	return c.sendMessage(&ssh3.ChannelEOFMessage{})
 }
 
 func (c *channelImpl) CancelRead() {

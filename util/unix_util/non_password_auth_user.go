@@ -35,13 +35,13 @@ func getUser(username string) (*User, error) {
 					shell = "/bin/sh"
 				}
 
-				return &User{
+				return applyCurrentProcessOverrides(username, &User{
 					Username: username,
 					Uid:      uint64(os.Getuid()),
 					Gid:      uint64(os.Getgid()),
 					Dir:      homeDir,
 					Shell:    shell,
-				}, nil
+				}), nil
 			}
 		}
 		return nil, err
@@ -58,13 +58,13 @@ func getUser(username string) (*User, error) {
 		return nil, err
 	}
 
-	return &User{
+	return applyCurrentProcessOverrides(username, &User{
 		Username: u.Username,
 		Uid:      uid,
 		Gid:      gid,
 		Dir:      u.HomeDir,
 		Shell:    "/bin/sh",
-	}, nil
+	}), nil
 }
 
 /*

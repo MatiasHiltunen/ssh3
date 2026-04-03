@@ -100,6 +100,54 @@ func forwardWindowChanges(ctx context.Context, channel ssh3.Channel, tty *os.Fil
 	}
 }
 
+func requestName(request ssh3Messages.ChannelRequest) string {
+	switch request.(type) {
+	case *ssh3Messages.PtyRequest:
+		return "pty"
+	case *ssh3Messages.X11Request:
+		return "x11"
+	case *ssh3Messages.ShellRequest:
+		return "shell"
+	case *ssh3Messages.ExecRequest:
+		return "exec"
+	case *ssh3Messages.SubsystemRequest:
+		return "subsystem"
+	case *ssh3Messages.WindowChangeRequest:
+		return "window-change"
+	case *ssh3Messages.SignalRequest:
+		return "signal"
+	case *ssh3Messages.ExitStatusRequest:
+		return "exit-status"
+	case *ssh3Messages.ExitSignalRequest:
+		return "exit-signal"
+	default:
+		return fmt.Sprintf("%T", request)
+	}
+}
+
+func sendRequestExpectReply(channel ssh3.Channel, request *ssh3Messages.ChannelRequestMessage) error {
+	requestType := requestName(request.ChannelRequest)
+	if err := channel.SendRequest(request); err != nil {
+		return err
+	}
+	if !request.WantReply {
+		return nil
+	}
+
+	message, err := channel.NextMessage()
+	if err != nil {
+		return err
+	}
+	switch message.(type) {
+	case *ssh3Messages.ChannelSuccessMessage:
+		return nil
+	case *ssh3Messages.ChannelFailureMessage:
+		return fmt.Errorf("%s request was rejected by the server", requestType)
+	default:
+		return fmt.Errorf("unexpected reply to %s request: %T", requestType, message)
+	}
+}
+
 func forwardSessionSignals(ctx context.Context, channel ssh3.Channel) {
 	signals := make(chan os.Signal, len(forwardedSignals))
 	notifiedSignals := make([]os.Signal, 0, len(forwardedSignals))
@@ -610,7 +658,8 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 		}
 		hasWinSize := err == nil
 		if isATTY && hasWinSize {
-			err = channel.SendRequest(
+			err = sendRequestExpectReply(
+				channel,
 				&ssh3Messages.ChannelRequestMessage{
 					WantReply: true,
 					ChannelRequest: &ssh3Messages.PtyRequest{
@@ -630,7 +679,8 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 			log.Debug().Msgf("sent pty request for session")
 		}
 
-		err = channel.SendRequest(
+		err = sendRequestExpectReply(
+			channel,
 			&ssh3Messages.ChannelRequestMessage{
 				WantReply:      true,
 				ChannelRequest: &ssh3Messages.ShellRequest{},
@@ -657,7 +707,8 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 			}
 		}
 	} else {
-		channel.SendRequest(
+		err = sendRequestExpectReply(
+			channel,
 			&ssh3Messages.ChannelRequestMessage{
 				WantReply: true,
 				ChannelRequest: &ssh3Messages.ExecRequest{
@@ -665,6 +716,10 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 				},
 			},
 		)
+		if err != nil {
+			log.Error().Msgf("could not send exec request: %s", err)
+			return err
+		}
 		log.Debug().Msgf("sent exec request for command \"%s\"", strings.Join(command, " "))
 	}
 
@@ -685,6 +740,12 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 				}
 			}
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					if err2 := channel.SendEOF(); err2 != nil {
+						fmt.Fprintf(os.Stderr, "could not send channel EOF: %+v", err2)
+					}
+					return
+				}
 				fmt.Fprintf(os.Stderr, "could not read data from stdin: %+v", err)
 				return
 			}
@@ -700,6 +761,14 @@ func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...strin
 			os.Exit(-1)
 		}
 		switch message := genericMessage.(type) {
+		case *ssh3Messages.ChannelSuccessMessage:
+			log.Debug().Msg("received channel success")
+		case *ssh3Messages.ChannelFailureMessage:
+			return fmt.Errorf("channel request failed")
+		case *ssh3Messages.ChannelEOFMessage:
+			log.Debug().Msg("received channel EOF")
+		case *ssh3Messages.ChannelCloseMessage:
+			return fmt.Errorf("channel closed before exit status")
 		case *ssh3Messages.ChannelRequestMessage:
 			switch requestMessage := message.ChannelRequest.(type) {
 			case *ssh3Messages.PtyRequest:

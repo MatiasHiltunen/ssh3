@@ -20,6 +20,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use http::{Request, Response, StatusCode};
 #[cfg(unix)]
+use nix::errno::Errno;
+#[cfg(unix)]
 use nix::pty::{Winsize, openpty};
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
@@ -50,6 +52,7 @@ use tokio::net::{TcpStream, UdpSocket};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{ChildStdin, Command};
+use tokio::sync::oneshot;
 
 pub type PasswordVerifier = Arc<dyn Fn(&str, &str) -> io::Result<bool> + Send + Sync + 'static>;
 
@@ -100,7 +103,7 @@ impl Default for ServerConfig {
             server_header: SSH3_VERSION_STRING.to_string(),
             max_packet_size: 30_000,
             default_datagrams_queue_size: 10,
-            require_authentication: false,
+            require_authentication: true,
             enable_password_login: false,
             authorized_identity_paths: Vec::new(),
             default_user: current_username(),
@@ -203,10 +206,10 @@ fn parse_request_authorization(request: &Request<()>) -> RequestAuthorization {
         };
     }
 
-    if let Some(token) = strip_scheme(value, "Bearer") {
-        if !token.is_empty() {
-            return RequestAuthorization::Bearer(token.to_string());
-        }
+    if let Some(token) = strip_scheme(value, "Bearer")
+        && !token.is_empty()
+    {
+        return RequestAuthorization::Bearer(token.to_string());
     }
 
     RequestAuthorization::None
@@ -625,15 +628,35 @@ impl PtyController {
 }
 
 struct RunningSession {
-    input: SessionInput,
+    input: Option<SessionInput>,
     child_id: Option<u32>,
     #[cfg(unix)]
     pty: Option<PtyController>,
+    terminate_tx: Option<oneshot::Sender<()>>,
+    exited_rx: Option<oneshot::Receiver<()>>,
+}
+
+impl Drop for RunningSession {
+    fn drop(&mut self) {
+        if let Some(terminate_tx) = self.terminate_tx.take() {
+            let _ = terminate_tx.send(());
+        }
+    }
 }
 
 impl RunningSession {
     async fn write_input(&mut self, data: &[u8]) -> Result<(), ServerError> {
-        self.input.write_all(data).await
+        let Some(input) = self.input.as_mut() else {
+            return Err(ServerError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session input has been closed",
+            )));
+        };
+        input.write_all(data).await
+    }
+
+    fn close_input(&mut self) {
+        self.input.take();
     }
 
     fn apply_window_change(&mut self, size: SessionPtySize) -> Result<(), ServerError> {
@@ -679,11 +702,7 @@ impl RunningSession {
         #[cfg(unix)]
         {
             let pid = child_id as i32;
-            if self.pty.is_some() {
-                signal::kill(Pid::from_raw(-pid), signal).map_err(io::Error::from)?;
-            } else {
-                signal::kill(Pid::from_raw(pid), signal).map_err(io::Error::from)?;
-            }
+            signal::kill(Pid::from_raw(-pid), signal).map_err(io::Error::from)?;
             return Ok(());
         }
 
@@ -692,6 +711,12 @@ impl RunningSession {
             io::ErrorKind::Unsupported,
             "signal forwarding is not supported on this platform",
         )))
+    }
+
+    async fn wait_for_exit(&mut self) {
+        if let Some(exited_rx) = self.exited_rx.take() {
+            let _ = exited_rx.await;
+        }
     }
 }
 
@@ -865,10 +890,10 @@ pub async fn serve_endpoint(endpoint: Endpoint, config: ServerConfig) -> Result<
         tokio::spawn(async move {
             match incoming.await {
                 Ok(connection) => {
-                    if let Err(err) = serve_connection(connection, config).await {
-                        if !is_benign_server_error(&err) {
-                            eprintln!("ssh3-server connection error: {err}");
-                        }
+                    if let Err(err) = serve_connection(connection, config).await
+                        && !is_benign_server_error(&err)
+                    {
+                        eprintln!("ssh3-server connection error: {err}");
                     }
                 }
                 Err(err) => {
@@ -1036,10 +1061,9 @@ async fn handle_conversation(
                             session_user,
                         )
                         .await
+                            && !is_benign_server_error(&err)
                         {
-                            if !is_benign_server_error(&err) {
-                                eprintln!("ssh3-server channel error: {err}");
-                            }
+                            eprintln!("ssh3-server channel error: {err}");
                         }
                     });
                 }
@@ -1116,27 +1140,40 @@ async fn handle_session_channel(
     let mut session: Option<RunningSession> = None;
 
     loop {
-        let message = channel.next_message().await?;
-        match message {
-            Message::ChannelRequest(request) => match request.request {
-                ChannelRequest::Pty(pty) => {
-                    if session.is_some() {
-                        write_stderr(
-                            channel.as_ref(),
-                            b"cannot request a PTY after the session has started\n",
-                        )
-                        .await?;
-                    } else {
-                        pending_pty = Some(PendingPty {
-                            term: ssh_bytes_to_string(&pty.term),
-                            size: SessionPtySize::from_pty_request(&pty),
-                        });
-                    }
+        let message = match channel.next_message().await {
+            Ok(message) => message,
+            Err(err) if is_session_input_terminated(&err) => {
+                if let Some(session) = session.as_mut() {
+                    session.close_input();
                 }
-                ChannelRequest::Shell => {
-                    if session.is_none() {
-                        session = Some(
-                            spawn_session_process(
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        match message {
+            Message::ChannelRequest(request) => {
+                let want_reply = request.want_reply;
+                let success = match request.request {
+                    ChannelRequest::Pty(pty) => {
+                        if session.is_some() {
+                            write_stderr(
+                                channel.as_ref(),
+                                b"cannot request a PTY after the session has started\n",
+                            )
+                            .await?;
+                            false
+                        } else {
+                            pending_pty = Some(PendingPty {
+                                term: ssh_bytes_to_string(&pty.term),
+                                size: SessionPtySize::from_pty_request(&pty),
+                            });
+                            true
+                        }
+                    }
+                    ChannelRequest::Shell => {
+                        if session.is_none() {
+                            match spawn_session_process(
                                 channel.clone(),
                                 &config,
                                 &session_user,
@@ -1153,16 +1190,26 @@ async fn handle_session_channel(
                                 },
                                 SessionCommand::Shell,
                             )
-                            .await?,
-                        );
-                    } else {
-                        write_stderr(channel.as_ref(), b"session is already running\n").await?;
+                            .await
+                            {
+                                Ok(started_session) => {
+                                    session = Some(started_session);
+                                    true
+                                }
+                                Err(err) => {
+                                    write_stderr(channel.as_ref(), format!("{err}\n").as_bytes())
+                                        .await?;
+                                    false
+                                }
+                            }
+                        } else {
+                            write_stderr(channel.as_ref(), b"session is already running\n").await?;
+                            false
+                        }
                     }
-                }
-                ChannelRequest::Exec(exec) => {
-                    if session.is_none() {
-                        session = Some(
-                            spawn_session_process(
+                    ChannelRequest::Exec(exec) => {
+                        if session.is_none() {
+                            match spawn_session_process(
                                 channel.clone(),
                                 &config,
                                 &session_user,
@@ -1181,49 +1228,77 @@ async fn handle_session_channel(
                                     ssh_bytes_to_string(&exec.command).unwrap_or_default(),
                                 ),
                             )
-                            .await?,
-                        );
-                    } else {
-                        write_stderr(channel.as_ref(), b"session is already running\n").await?;
-                    }
-                }
-                ChannelRequest::Signal(signal) => {
-                    if let Some(session) = session.as_ref() {
-                        if let Err(err) = session.send_signal(&signal) {
-                            write_stderr(channel.as_ref(), format!("{err}\n").as_bytes()).await?;
+                            .await
+                            {
+                                Ok(started_session) => {
+                                    session = Some(started_session);
+                                    true
+                                }
+                                Err(err) => {
+                                    write_stderr(channel.as_ref(), format!("{err}\n").as_bytes())
+                                        .await?;
+                                    false
+                                }
+                            }
+                        } else {
+                            write_stderr(channel.as_ref(), b"session is already running\n").await?;
+                            false
                         }
-                    } else {
+                    }
+                    ChannelRequest::Signal(signal) => {
+                        if let Some(session) = session.as_ref() {
+                            if let Err(err) = session.send_signal(&signal) {
+                                write_stderr(channel.as_ref(), format!("{err}\n").as_bytes())
+                                    .await?;
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            write_stderr(
+                                channel.as_ref(),
+                                b"cannot signal a session before it has started\n",
+                            )
+                            .await?;
+                            false
+                        }
+                    }
+                    ChannelRequest::WindowChange(window_change) => {
+                        let size = SessionPtySize::from_window_change(&window_change);
+                        if let Some(session) = session.as_mut() {
+                            if let Err(err) = session.apply_window_change(size) {
+                                write_stderr(channel.as_ref(), format!("{err}\n").as_bytes())
+                                    .await?;
+                                false
+                            } else {
+                                true
+                            }
+                        } else if let Some(pending_pty) = pending_pty.as_mut() {
+                            pending_pty.size = size;
+                            true
+                        } else {
+                            write_stderr(
+                                channel.as_ref(),
+                                b"window-change requires a pending or running PTY session\n",
+                            )
+                            .await?;
+                            false
+                        }
+                    }
+                    other => {
                         write_stderr(
                             channel.as_ref(),
-                            b"cannot signal a session before it has started\n",
+                            format!("unsupported session request: {other:?}\n").as_bytes(),
                         )
                         .await?;
+                        false
                     }
+                };
+
+                if want_reply {
+                    send_channel_request_reply(channel.as_ref(), success).await?;
                 }
-                ChannelRequest::WindowChange(window_change) => {
-                    let size = SessionPtySize::from_window_change(&window_change);
-                    if let Some(session) = session.as_mut() {
-                        if let Err(err) = session.apply_window_change(size) {
-                            write_stderr(channel.as_ref(), format!("{err}\n").as_bytes()).await?;
-                        }
-                    } else if let Some(pending_pty) = pending_pty.as_mut() {
-                        pending_pty.size = size;
-                    } else {
-                        write_stderr(
-                            channel.as_ref(),
-                            b"window-change requires a pending or running PTY session\n",
-                        )
-                        .await?;
-                    }
-                }
-                other => {
-                    write_stderr(
-                        channel.as_ref(),
-                        format!("unsupported session request: {other:?}\n").as_bytes(),
-                    )
-                    .await?;
-                }
-            },
+            }
             Message::Data(message) => {
                 if message.data_type != SSH_EXTENDED_DATA_NONE {
                     write_stderr(channel.as_ref(), b"unsupported extended data message\n").await?;
@@ -1235,15 +1310,20 @@ async fn handle_session_channel(
                     #[cfg(unix)]
                     {
                         if agent_forwarding.is_none() {
-                            agent_forwarding = Some(
-                                open_agent_socket_and_forward_agent(
-                                    conversation.clone(),
-                                    connection.clone(),
-                                    &config,
-                                    &session_user,
-                                )
-                                .await?,
-                            );
+                            match open_agent_socket_and_forward_agent(
+                                conversation.clone(),
+                                connection.clone(),
+                                &config,
+                                &session_user,
+                            )
+                            .await
+                            {
+                                Ok(forwarding) => agent_forwarding = Some(forwarding),
+                                Err(err) => {
+                                    write_stderr(channel.as_ref(), format!("{err}\n").as_bytes())
+                                        .await?;
+                                }
+                            }
                         }
                     }
 
@@ -1263,6 +1343,23 @@ async fn handle_session_channel(
                     .await?;
                 }
             }
+            Message::ChannelEof => {
+                if let Some(session) = session.as_mut() {
+                    session.close_input();
+                    tokio::select! {
+                        _ = session.wait_for_exit() => {}
+                        _ = connection.closed() => {}
+                    }
+                }
+                return Ok(());
+            }
+            Message::ChannelClose => {
+                if let Some(session) = session.as_mut() {
+                    session.close_input();
+                }
+                return Ok(());
+            }
+            Message::ChannelSuccess | Message::ChannelFailure => {}
             _ => {}
         }
     }
@@ -1319,6 +1416,15 @@ async fn spawn_pipe_session_process(
         &command,
         agent_socket_path,
     );
+    #[cfg(unix)]
+    unsafe {
+        process.pre_exec(|| {
+            if nix::libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     process
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1333,6 +1439,8 @@ async fn spawn_pipe_session_process(
         .ok_or_else(|| ServerError::Io(io::Error::other("spawned process did not expose stdin")))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let (terminate_tx, mut terminate_rx) = oneshot::channel();
+    let (exited_tx, exited_rx) = oneshot::channel();
 
     let stdout_task = tokio::spawn(pump_process_output(
         stdout,
@@ -1346,7 +1454,13 @@ async fn spawn_pipe_session_process(
     ));
 
     tokio::spawn(async move {
-        let status = child.wait().await;
+        let status = tokio::select! {
+            status = child.wait() => status,
+            _ = &mut terminate_rx => {
+                terminate_session_process(&mut child, child_id).await;
+                child.wait().await
+            }
+        };
         let _ = stdout_task.await;
         let _ = stderr_task.await;
 
@@ -1361,13 +1475,16 @@ async fn spawn_pipe_session_process(
                 request: ChannelRequest::ExitStatus(ExitStatusRequest { exit_status }),
             })
             .await;
+        let _ = exited_tx.send(());
     });
 
     Ok(RunningSession {
-        input: SessionInput::Pipe(stdin),
+        input: Some(SessionInput::Pipe(stdin)),
         child_id,
         #[cfg(unix)]
         pty: None,
+        terminate_tx: Some(terminate_tx),
+        exited_rx: Some(exited_rx),
     })
 }
 
@@ -1411,7 +1528,7 @@ async fn spawn_pty_session_process(
             if nix::libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY, 0) == -1 {
+            if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY.into(), 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -1425,6 +1542,8 @@ async fn spawn_pty_session_process(
     let input = TokioFile::from_std(master.try_clone()?);
     let output = TokioFile::from_std(master.try_clone()?);
     let controller = PtyController { master };
+    let (terminate_tx, mut terminate_rx) = oneshot::channel();
+    let (exited_tx, exited_rx) = oneshot::channel();
 
     let output_task = tokio::spawn(pump_process_output(
         Some(output),
@@ -1432,7 +1551,13 @@ async fn spawn_pty_session_process(
         SSH_EXTENDED_DATA_NONE,
     ));
     tokio::spawn(async move {
-        let status = child.wait().await;
+        let status = tokio::select! {
+            status = child.wait() => status,
+            _ = &mut terminate_rx => {
+                terminate_session_process(&mut child, child_id).await;
+                child.wait().await
+            }
+        };
         let _ = output_task.await;
 
         let exit_status = status
@@ -1446,12 +1571,15 @@ async fn spawn_pty_session_process(
                 request: ChannelRequest::ExitStatus(ExitStatusRequest { exit_status }),
             })
             .await;
+        let _ = exited_tx.send(());
     });
 
     Ok(RunningSession {
-        input: SessionInput::Pty(input),
+        input: Some(SessionInput::Pty(input)),
         child_id,
         pty: Some(controller),
+        terminate_tx: Some(terminate_tx),
+        exited_rx: Some(exited_rx),
     })
 }
 
@@ -1524,15 +1652,17 @@ async fn handle_agent_socket_conn(
         async move {
             loop {
                 let message = channel.next_message().await?;
-                if let Message::Data(data) = message
-                    && data.data_type == SSH_EXTENDED_DATA_NONE
-                {
-                    writer.write_all(&data.data).await?;
-                    writer.flush().await?;
+                match message {
+                    Message::Data(data) if data.data_type == SSH_EXTENDED_DATA_NONE => {
+                        writer.write_all(&data.data).await?;
+                        writer.flush().await?;
+                    }
+                    Message::ChannelEof | Message::ChannelClose => {
+                        return Ok::<(), ServerError>(());
+                    }
+                    _ => {}
                 }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), ServerError>(())
         }
     });
 
@@ -1608,10 +1738,9 @@ async fn open_agent_socket_and_forward_agent(
                         default_datagrams_queue_size,
                     )
                     .await
+                        && !is_benign_server_error(&err)
                     {
-                        if !is_benign_server_error(&err) {
-                            eprintln!("ssh3-server agent forwarding error: {err}");
-                        }
+                        eprintln!("ssh3-server agent forwarding error: {err}");
                     }
                 });
             }
@@ -1623,6 +1752,15 @@ async fn open_agent_socket_and_forward_agent(
         socket_dir,
         listener_task,
     })
+}
+
+async fn send_channel_request_reply(channel: &Channel, success: bool) -> Result<(), ServerError> {
+    if success {
+        channel.send_request_success().await?;
+    } else {
+        channel.send_request_failure().await?;
+    }
+    Ok(())
 }
 
 async fn pump_process_output<R>(
@@ -1725,11 +1863,15 @@ async fn handle_tcp_forwarding(
                     _ = connection.closed() => return Ok::<(), ServerError>(()),
                     message = channel.next_message() => {
                         let message = message?;
-                        if let Message::Data(data) = message
-                            && data.data_type == SSH_EXTENDED_DATA_NONE
-                        {
-                            writer.write_all(&data.data).await?;
-                            writer.flush().await?;
+                        match message {
+                            Message::Data(data) if data.data_type == SSH_EXTENDED_DATA_NONE => {
+                                writer.write_all(&data.data).await?;
+                                writer.flush().await?;
+                            }
+                            Message::ChannelEof | Message::ChannelClose => {
+                                return Ok::<(), ServerError>(());
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1773,6 +1915,10 @@ async fn write_stderr(channel: &Channel, message: &[u8]) -> Result<(), ServerErr
         .await
         .map(|_| ())
         .map_err(ServerError::from)
+}
+
+fn is_session_input_terminated(error: &ChannelError) -> bool {
+    matches!(error, ChannelError::Io(err) if is_benign_io_error(err))
 }
 
 fn clamp_u64_to_u16(value: u64) -> u16 {
@@ -1862,6 +2008,26 @@ fn is_benign_channel_error(error: &ChannelError) -> bool {
     matches!(error, ChannelError::Io(error) if is_benign_io_error(error))
 }
 
+async fn terminate_session_process(child: &mut tokio::process::Child, child_id: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(child_id) = child_id
+        && terminate_session_process_group(child_id).is_ok()
+    {
+        return;
+    }
+
+    let _ = child.kill().await;
+}
+
+#[cfg(unix)]
+fn terminate_session_process_group(child_id: u32) -> io::Result<()> {
+    let pid = Pid::from_raw(-(child_id as i32));
+    match signal::kill(pid, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(err) => Err(io::Error::from(err)),
+    }
+}
+
 fn is_benign_conversation_error(error: &ConversationError) -> bool {
     matches!(error, ConversationError::Channel(error) if is_benign_channel_error(error))
 }
@@ -1947,6 +2113,13 @@ mod tests {
         BASE64_STANDARD, ServerConfig, current_username, effective_shell, lookup_session_user,
         serve_connection,
     };
+
+    fn unauthenticated_server_config() -> ServerConfig {
+        ServerConfig {
+            require_authentication: false,
+            ..ServerConfig::default()
+        }
+    }
 
     struct TestHarness {
         client_endpoint: quinn::Endpoint,
@@ -2298,19 +2471,30 @@ mod tests {
                     SSH_EXTENDED_DATA_STDERR => stderr.extend_from_slice(&data.data),
                     _ => {}
                 },
-                Message::ChannelRequest(message) => match message.request {
-                    ChannelRequest::ExitStatus(ExitStatusRequest { exit_status }) => {
+                Message::ChannelRequest(message) => {
+                    if let ChannelRequest::ExitStatus(ExitStatusRequest { exit_status }) =
+                        message.request
+                    {
                         return SessionOutput {
                             stdout,
                             stderr,
                             exit_status,
                         };
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        let result = unsafe { nix::libc::kill(pid, 0) };
+        if result == 0 {
+            return true;
+        }
+
+        std::io::Error::last_os_error().raw_os_error() != Some(nix::libc::ESRCH)
     }
 
     fn normalize_pty_output(bytes: &[u8]) -> String {
@@ -2517,7 +2701,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_requests_run_commands_and_report_exit_status() {
-        let harness = setup_harness(ServerConfig::default()).await;
+        let harness = setup_harness(unauthenticated_server_config()).await;
         let channel = harness.open_session_channel().await;
         channel
             .send_request(ChannelRequestMessage {
@@ -2539,7 +2723,7 @@ mod tests {
 
     #[tokio::test]
     async fn pty_requests_create_a_tty_and_apply_live_window_changes() {
-        let harness = setup_harness(ServerConfig::default()).await;
+        let harness = setup_harness(unauthenticated_server_config()).await;
         let channel = harness.open_session_channel().await;
         channel
             .send_request(ChannelRequestMessage {
@@ -2593,7 +2777,7 @@ mod tests {
 
     #[tokio::test]
     async fn signal_requests_are_forwarded_to_the_running_session() {
-        let harness = setup_harness(ServerConfig::default()).await;
+        let harness = setup_harness(unauthenticated_server_config()).await;
         let channel = harness.open_session_channel().await;
         channel
             .send_request(ChannelRequestMessage {
@@ -2624,11 +2808,59 @@ mod tests {
         harness.shutdown().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_the_session_channel_terminates_the_process_group() {
+        let harness = setup_harness(unauthenticated_server_config()).await;
+        let channel = harness.open_session_channel().await;
+        let tempdir = TempDir::new().unwrap();
+        let child_pid_path = tempdir.path().join("child.pid");
+        let command = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > {}; wait \"$child\"",
+            child_pid_path.display()
+        );
+        channel
+            .send_request(ChannelRequestMessage {
+                want_reply: true,
+                request: ChannelRequest::Exec(ExecRequest {
+                    command: command.into_bytes(),
+                }),
+            })
+            .await
+            .unwrap();
+
+        let child_pid = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = fs::read_to_string(&child_pid_path)
+                    && let Ok(pid) = pid.trim().parse::<i32>()
+                {
+                    return pid;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(process_exists(child_pid));
+        channel.send_message(Message::ChannelClose).await.unwrap();
+        channel.close().await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while process_exists(child_pid) {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        harness.shutdown().await;
+    }
+
     #[tokio::test]
     async fn requested_user_header_selects_the_session_environment() {
         let username = current_username().expect("current user should resolve");
         let session_user = lookup_session_user(&username).unwrap();
-        let mut config = ServerConfig::default();
+        let mut config = unauthenticated_server_config();
         config.default_user = Some("does-not-exist".to_string());
         let expected_shell = effective_shell(&config, &session_user);
 
@@ -2665,10 +2897,11 @@ mod tests {
     #[tokio::test]
     async fn bearer_tokens_authorize_session_startup() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
-        let mut config = ServerConfig::default();
-        config.require_authentication = true;
-        config.authorized_identity_paths = vec![fixture.authorized_identities_path.clone()];
-        config.default_user = Some("does-not-exist".to_string());
+        let config = ServerConfig {
+            authorized_identity_paths: vec![fixture.authorized_identities_path.clone()],
+            default_user: Some("does-not-exist".to_string()),
+            ..ServerConfig::default()
+        };
 
         let harness = attempt_authenticated_harness(
             config,
@@ -2699,10 +2932,11 @@ mod tests {
     #[tokio::test]
     async fn missing_bearer_token_is_rejected_when_auth_is_required() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
-        let mut config = ServerConfig::default();
-        config.require_authentication = true;
-        config.authorized_identity_paths = vec![fixture.authorized_identities_path.clone()];
-        config.default_user = Some("does-not-exist".to_string());
+        let config = ServerConfig {
+            authorized_identity_paths: vec![fixture.authorized_identities_path.clone()],
+            default_user: Some("does-not-exist".to_string()),
+            ..ServerConfig::default()
+        };
 
         match attempt_harness(config, Some(&fixture.username)).await {
             Err(ClientConversationError::UnexpectedStatus { status }) => {
@@ -2717,10 +2951,11 @@ mod tests {
     #[tokio::test]
     async fn oidc_identity_tokens_authorize_session_startup() {
         let fixture = create_oidc_fixture().await;
-        let mut config = ServerConfig::default();
-        config.require_authentication = true;
-        config.authorized_identity_paths = vec![fixture.authorized_identities_path.clone()];
-        config.default_user = Some("does-not-exist".to_string());
+        let config = ServerConfig {
+            authorized_identity_paths: vec![fixture.authorized_identities_path.clone()],
+            default_user: Some("does-not-exist".to_string()),
+            ..ServerConfig::default()
+        };
 
         let harness = attempt_oidc_harness(config, Some(&fixture.username), &fixture)
             .await
@@ -2747,15 +2982,17 @@ mod tests {
     async fn basic_password_auth_authorizes_session_startup() {
         let username = current_username().unwrap();
         let password = "correct horse battery staple";
-        let mut config = ServerConfig::default();
-        config.enable_password_login = true;
-        config.default_user = Some("does-not-exist".to_string());
-        config.password_verifier = Some(Arc::new({
-            let username = username.clone();
-            move |candidate_username, candidate_password| {
-                Ok(candidate_username == username && candidate_password == password)
-            }
-        }));
+        let config = ServerConfig {
+            enable_password_login: true,
+            default_user: Some("does-not-exist".to_string()),
+            password_verifier: Some(Arc::new({
+                let username = username.clone();
+                move |candidate_username, candidate_password| {
+                    Ok(candidate_username == username && candidate_password == password)
+                }
+            })),
+            ..ServerConfig::default()
+        };
 
         let harness = attempt_harness_with_headers(
             config,
@@ -2784,10 +3021,12 @@ mod tests {
 
     #[tokio::test]
     async fn missing_basic_auth_is_rejected_when_password_login_is_required() {
-        let mut config = ServerConfig::default();
-        config.enable_password_login = true;
-        config.default_user = Some(current_username().unwrap());
-        config.password_verifier = Some(Arc::new(|_, _| Ok(false)));
+        let config = ServerConfig {
+            enable_password_login: true,
+            default_user: Some(current_username().unwrap()),
+            password_verifier: Some(Arc::new(|_, _| Ok(false))),
+            ..ServerConfig::default()
+        };
 
         match attempt_harness(config, None).await {
             Err(ClientConversationError::UnexpectedStatus { status }) => {
@@ -2802,10 +3041,11 @@ mod tests {
     #[tokio::test]
     async fn nist_p256_bearer_tokens_authorize_session_startup() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::NistP256);
-        let mut config = ServerConfig::default();
-        config.require_authentication = true;
-        config.authorized_identity_paths = vec![fixture.authorized_identities_path.clone()];
-        config.default_user = Some("does-not-exist".to_string());
+        let config = ServerConfig {
+            authorized_identity_paths: vec![fixture.authorized_identities_path.clone()],
+            default_user: Some("does-not-exist".to_string()),
+            ..ServerConfig::default()
+        };
 
         let harness = attempt_authenticated_harness(
             config,
@@ -2836,10 +3076,11 @@ mod tests {
     #[tokio::test]
     async fn rsa_bearer_tokens_authorize_session_startup() {
         let fixture = create_auth_fixture(AuthKeyAlgorithm::Rsa);
-        let mut config = ServerConfig::default();
-        config.require_authentication = true;
-        config.authorized_identity_paths = vec![fixture.authorized_identities_path.clone()];
-        config.default_user = Some("does-not-exist".to_string());
+        let config = ServerConfig {
+            authorized_identity_paths: vec![fixture.authorized_identities_path.clone()],
+            default_user: Some("does-not-exist".to_string()),
+            ..ServerConfig::default()
+        };
 
         let harness = attempt_authenticated_harness(
             config,
@@ -2869,7 +3110,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requests_start_a_login_shell() {
-        let harness = setup_harness(ServerConfig::default()).await;
+        let harness = setup_harness(unauthenticated_server_config()).await;
         let channel = harness.open_session_channel().await;
         channel
             .send_request(ChannelRequestMessage {
@@ -2896,8 +3137,10 @@ mod tests {
 
     #[tokio::test]
     async fn missing_requested_and_default_user_is_rejected() {
-        let mut config = ServerConfig::default();
-        config.default_user = None;
+        let config = ServerConfig {
+            default_user: None,
+            ..ServerConfig::default()
+        };
 
         let (server_config_tls, server_certificate) =
             self_signed_server_config(vec!["localhost".to_string()]).unwrap();

@@ -2,6 +2,7 @@ package message
 
 import (
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/francoismichel/ssh3/util"
@@ -45,6 +46,60 @@ const (
 type Message interface {
 	Write(buf []byte) (n int, err error)
 	Length() int
+}
+
+type ChannelEOFMessage struct{}
+
+var _ Message = &ChannelEOFMessage{}
+
+func (m *ChannelEOFMessage) Write(buf []byte) (consumed int, err error) {
+	return writeChannelControlMessage(buf, SSH_MSG_CHANNEL_EOF)
+}
+
+func (m *ChannelEOFMessage) Length() int {
+	return int(util.VarIntLen(SSH_MSG_CHANNEL_EOF))
+}
+
+type ChannelCloseMessage struct{}
+
+var _ Message = &ChannelCloseMessage{}
+
+func (m *ChannelCloseMessage) Write(buf []byte) (consumed int, err error) {
+	return writeChannelControlMessage(buf, SSH_MSG_CHANNEL_CLOSE)
+}
+
+func (m *ChannelCloseMessage) Length() int {
+	return int(util.VarIntLen(SSH_MSG_CHANNEL_CLOSE))
+}
+
+type ChannelSuccessMessage struct{}
+
+var _ Message = &ChannelSuccessMessage{}
+
+func (m *ChannelSuccessMessage) Write(buf []byte) (consumed int, err error) {
+	return writeChannelControlMessage(buf, SSH_MSG_CHANNEL_SUCCESS)
+}
+
+func (m *ChannelSuccessMessage) Length() int {
+	return int(util.VarIntLen(SSH_MSG_CHANNEL_SUCCESS))
+}
+
+type ChannelFailureMessage struct{}
+
+var _ Message = &ChannelFailureMessage{}
+
+func (m *ChannelFailureMessage) Write(buf []byte) (consumed int, err error) {
+	return writeChannelControlMessage(buf, SSH_MSG_CHANNEL_FAILURE)
+}
+
+func (m *ChannelFailureMessage) Length() int {
+	return int(util.VarIntLen(SSH_MSG_CHANNEL_FAILURE))
+}
+
+func writeChannelControlMessage(buf []byte, messageType uint64) (consumed int, err error) {
+	varintBuf := util.AppendVarInt(nil, messageType)
+	consumed = copy(buf, varintBuf)
+	return consumed, nil
 }
 
 type ChannelOpenConfirmationMessage struct {
@@ -207,6 +262,14 @@ func ParseMessage(r util.Reader) (Message, error) {
 		return ParseChannelOpenConfirmationMessage(r)
 	case SSH_MSG_CHANNEL_OPEN_FAILURE:
 		return ParseChannelOpenFailureMessage(r)
+	case SSH_MSG_CHANNEL_EOF:
+		return &ChannelEOFMessage{}, nil
+	case SSH_MSG_CHANNEL_CLOSE:
+		return &ChannelCloseMessage{}, nil
+	case SSH_MSG_CHANNEL_SUCCESS:
+		return &ChannelSuccessMessage{}, nil
+	case SSH_MSG_CHANNEL_FAILURE:
+		return &ChannelFailureMessage{}, nil
 	case SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EXTENDED_DATA:
 		if typeId == SSH_MSG_CHANNEL_DATA {
 			return ParseDataMessage(r)
@@ -214,6 +277,6 @@ func ParseMessage(r util.Reader) (Message, error) {
 			return ParseExtendedDataMessage(r)
 		}
 	default:
-		panic("not implemented")
+		return nil, fmt.Errorf("unsupported message type: %d", typeId)
 	}
 }

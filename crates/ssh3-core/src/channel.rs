@@ -273,29 +273,25 @@ impl Channel {
             return Ok(());
         }
 
-        loop {
-            let message = {
-                let mut recv = self.recv.lock().await;
-                parse_message(recv.as_mut()).await?
-            };
+        let message = {
+            let mut recv = self.recv.lock().await;
+            parse_message(recv.as_mut()).await?
+        };
 
-            match message {
-                Message::ChannelOpenConfirmation(_) => {
-                    self.confirm_received.store(true, Ordering::SeqCst);
-                    return Ok(());
-                }
-                Message::ChannelOpenFailure(message) => {
-                    return Err(ChannelError::OpenFailure(ChannelOpenFailure {
-                        reason_code: message.reason_code,
-                        error_message_utf8: message.error_message_utf8,
-                    }));
-                }
-                other => {
-                    return Err(ChannelError::NonConfirmed(MessageOnNonConfirmedChannel {
-                        message: other,
-                    }));
-                }
+        match message {
+            Message::ChannelOpenConfirmation(_) => {
+                self.confirm_received.store(true, Ordering::SeqCst);
+                Ok(())
             }
+            Message::ChannelOpenFailure(message) => {
+                Err(ChannelError::OpenFailure(ChannelOpenFailure {
+                    reason_code: message.reason_code,
+                    error_message_utf8: message.error_message_utf8,
+                }))
+            }
+            other => Err(ChannelError::NonConfirmed(MessageOnNonConfirmedChannel {
+                message: other,
+            })),
         }
     }
 
@@ -418,6 +414,18 @@ impl Channel {
         self.send_message(Message::ChannelRequest(request)).await
     }
 
+    pub async fn send_request_success(&self) -> Result<(), ChannelError> {
+        self.send_message(Message::ChannelSuccess).await
+    }
+
+    pub async fn send_request_failure(&self) -> Result<(), ChannelError> {
+        self.send_message(Message::ChannelFailure).await
+    }
+
+    pub async fn send_eof(&self) -> Result<(), ChannelError> {
+        self.send_message(Message::ChannelEof).await
+    }
+
     pub async fn cancel_read(&self) {
         self.recv.lock().await.cancel_read(42);
     }
@@ -454,6 +462,10 @@ async fn parse_message(recv: &mut dyn ReceiveStream) -> Result<Message, ChannelE
                 language_tag: read_ssh_bytes(recv).await?,
             })
         }
+        ssh3_proto::SSH_MSG_CHANNEL_SUCCESS => Message::ChannelSuccess,
+        ssh3_proto::SSH_MSG_CHANNEL_FAILURE => Message::ChannelFailure,
+        ssh3_proto::SSH_MSG_CHANNEL_EOF => Message::ChannelEof,
+        ssh3_proto::SSH_MSG_CHANNEL_CLOSE => Message::ChannelClose,
         ssh3_proto::SSH_MSG_CHANNEL_DATA => Message::Data(DataOrExtendedDataMessage {
             data_type: SSH_EXTENDED_DATA_NONE,
             data: read_ssh_bytes(recv).await?,

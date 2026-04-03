@@ -296,8 +296,17 @@ func handleChannel(user *unix_util.User, channel ssh3.Channel) {
 	}
 	execRequest, ok := requestMessage.ChannelRequest.(*ssh3Messages.ExecRequest)
 	if !ok {
+		if requestMessage.WantReply {
+			_ = channel.SendRequestFailure()
+		}
 		_ = writeStderr(channel, "unsupported request\n")
 		return
+	}
+	if requestMessage.WantReply {
+		if err := channel.SendRequestSuccess(); err != nil {
+			_ = writeStderr(channel, fmt.Sprintf("could not send request reply: %s\n", err))
+			return
+		}
 	}
 
 	if err := runExec(user, channel, execRequest.Command); err != nil {

@@ -43,6 +43,10 @@ pub enum Message {
     ChannelRequest(ChannelRequestMessage),
     ChannelOpenConfirmation(ChannelOpenConfirmationMessage),
     ChannelOpenFailure(ChannelOpenFailureMessage),
+    ChannelSuccess,
+    ChannelFailure,
+    ChannelEof,
+    ChannelClose,
     Data(DataOrExtendedDataMessage),
 }
 
@@ -58,6 +62,10 @@ impl Message {
             SSH_MSG_CHANNEL_OPEN_FAILURE => Ok(Self::ChannelOpenFailure(
                 ChannelOpenFailureMessage::parse_payload(reader)?,
             )),
+            SSH_MSG_CHANNEL_SUCCESS => Ok(Self::ChannelSuccess),
+            SSH_MSG_CHANNEL_FAILURE => Ok(Self::ChannelFailure),
+            SSH_MSG_CHANNEL_EOF => Ok(Self::ChannelEof),
+            SSH_MSG_CHANNEL_CLOSE => Ok(Self::ChannelClose),
             SSH_MSG_CHANNEL_DATA => Ok(Self::Data(DataOrExtendedDataMessage::parse_data_payload(
                 reader,
             )?)),
@@ -73,6 +81,10 @@ impl Message {
             Self::ChannelRequest(message) => message.encoded_len(),
             Self::ChannelOpenConfirmation(message) => message.encoded_len(),
             Self::ChannelOpenFailure(message) => message.encoded_len(),
+            Self::ChannelSuccess => var_int_len(SSH_MSG_CHANNEL_SUCCESS),
+            Self::ChannelFailure => var_int_len(SSH_MSG_CHANNEL_FAILURE),
+            Self::ChannelEof => var_int_len(SSH_MSG_CHANNEL_EOF),
+            Self::ChannelClose => var_int_len(SSH_MSG_CHANNEL_CLOSE),
             Self::Data(message) => message.encoded_len(),
         }
     }
@@ -82,6 +94,10 @@ impl Message {
             Self::ChannelRequest(message) => message.encode(out),
             Self::ChannelOpenConfirmation(message) => message.encode(out),
             Self::ChannelOpenFailure(message) => message.encode(out),
+            Self::ChannelSuccess => append_var_int(out, SSH_MSG_CHANNEL_SUCCESS),
+            Self::ChannelFailure => append_var_int(out, SSH_MSG_CHANNEL_FAILURE),
+            Self::ChannelEof => append_var_int(out, SSH_MSG_CHANNEL_EOF),
+            Self::ChannelClose => append_var_int(out, SSH_MSG_CHANNEL_CLOSE),
             Self::Data(message) => message.encode(out),
         }
     }
@@ -641,8 +657,9 @@ mod tests {
         ChannelOpenConfirmationMessage, ChannelOpenFailureMessage, ChannelRequest,
         ChannelRequestMessage, DataOrExtendedDataMessage, ExecRequest, ExitSignalRequest,
         ExitStatusRequest, ForwardingProtocol, ForwardingRequest, Message, PtyRequest,
-        SSH_EXTENDED_DATA_NONE, SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EXTENDED_DATA,
-        SSH_MSG_CHANNEL_OPEN_CONFIRMATION, SSH_MSG_CHANNEL_OPEN_FAILURE, SSH_MSG_CHANNEL_REQUEST,
+        SSH_EXTENDED_DATA_NONE, SSH_MSG_CHANNEL_CLOSE, SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EOF,
+        SSH_MSG_CHANNEL_EXTENDED_DATA, SSH_MSG_CHANNEL_FAILURE, SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
+        SSH_MSG_CHANNEL_OPEN_FAILURE, SSH_MSG_CHANNEL_REQUEST, SSH_MSG_CHANNEL_SUCCESS,
         SignalRequest, SubsystemRequest, WindowChangeRequest, X11Request,
     };
     use crate::wire::{append_ssh_bytes, append_var_int, write_bool};
@@ -934,5 +951,24 @@ mod tests {
         assert_eq!(message.encoded_len(), expected.len());
         assert_eq!(message.to_vec(), expected);
         assert_eq!(parse_message(&expected), message);
+    }
+
+    #[test]
+    fn parses_and_writes_channel_control_messages() {
+        let cases = [
+            (Message::ChannelSuccess, SSH_MSG_CHANNEL_SUCCESS),
+            (Message::ChannelFailure, SSH_MSG_CHANNEL_FAILURE),
+            (Message::ChannelEof, SSH_MSG_CHANNEL_EOF),
+            (Message::ChannelClose, SSH_MSG_CHANNEL_CLOSE),
+        ];
+
+        for (message, message_type) in cases {
+            let mut expected = Vec::new();
+            append_var_int(&mut expected, message_type);
+
+            assert_eq!(message.encoded_len(), expected.len());
+            assert_eq!(message.to_vec(), expected);
+            assert_eq!(parse_message(&expected), message);
+        }
     }
 }

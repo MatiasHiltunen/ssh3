@@ -13,6 +13,7 @@ use crate::transport::{DatagramSender, ReceiveStream, SendStream};
 pub type ConversationId = [u8; 32];
 
 const DANGLING_DATAGRAM_QUEUE_SIZE: usize = 10;
+const MAX_DANGLING_DATAGRAM_CHANNELS: usize = 64;
 
 #[derive(Debug)]
 pub enum ConversationError {
@@ -236,13 +237,11 @@ impl Conversation {
     }
 
     pub async fn accept_channel_with_metadata(&self) -> Result<AcceptedChannel, ConversationError> {
-        loop {
-            if let Some(channel) = self.channels_accept_queue.next() {
-                return self.confirm_and_register_channel(channel).await;
-            }
-            let channel = self.channels_accept_queue.wait_next().await;
-            return self.confirm_and_register_channel(channel).await;
-        }
+        let channel = match self.channels_accept_queue.next() {
+            Some(channel) => channel,
+            None => self.channels_accept_queue.wait_next().await,
+        };
+        self.confirm_and_register_channel(channel).await
     }
 
     pub async fn add_datagram(&self, datagram: &[u8]) -> Result<(), ConversationError> {
@@ -256,10 +255,16 @@ impl Conversation {
             return Ok(());
         }
 
-        let queue = Arc::new(DatagramQueue::new(DANGLING_DATAGRAM_QUEUE_SIZE));
-        let _ = queue.add(payload);
-        self.channels_manager
-            .add_dangling_datagrams_queue(channel_id, queue);
+        if let Some(queue) = self
+            .channels_manager
+            .get_or_create_dangling_datagrams_queue(
+                channel_id,
+                DANGLING_DATAGRAM_QUEUE_SIZE,
+                MAX_DANGLING_DATAGRAM_CHANNELS,
+            )
+        {
+            let _ = queue.add(payload);
+        }
         Err(ConversationError::ChannelNotFound { channel_id })
     }
 
@@ -316,24 +321,25 @@ impl ChannelsManager {
         }
     }
 
-    fn add_dangling_datagrams_queue(&self, channel_id: u64, queue: Arc<DatagramQueue>) {
-        let existing_channel = {
-            let mut state = self.state.lock().unwrap();
-            if let Some(channel) = state.channels.get(&channel_id) {
-                Some(channel.clone())
-            } else {
-                state
-                    .dangling_datagram_queues
-                    .insert(channel_id, queue.clone());
-                None
-            }
-        };
-
-        if let Some(channel) = existing_channel {
-            while let Some(datagram) = queue.next() {
-                channel.add_datagram(datagram);
-            }
+    fn get_or_create_dangling_datagrams_queue(
+        &self,
+        channel_id: u64,
+        queue_capacity: usize,
+        max_channels: usize,
+    ) -> Option<Arc<DatagramQueue>> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(queue) = state.dangling_datagram_queues.get(&channel_id) {
+            return Some(queue.clone());
         }
+        if state.dangling_datagram_queues.len() >= max_channels {
+            return None;
+        }
+
+        let queue = Arc::new(DatagramQueue::new(queue_capacity));
+        state
+            .dangling_datagram_queues
+            .insert(channel_id, queue.clone());
+        Some(queue)
     }
 
     fn get_channel(&self, channel_id: u64) -> Option<Arc<Channel>> {
@@ -513,6 +519,29 @@ mod tests {
         let channel = conversation.open_channel(42, b"session".to_vec(), 1024, 8, recv, send);
 
         assert_eq!(channel.receive_datagram().await, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn multiple_dangling_datagrams_for_the_same_channel_are_preserved() {
+        let sender = Arc::new(RecordingDatagramSender::default());
+        let conversation = Conversation::new(10, conversation_id(), 2048, 8, sender);
+
+        let mut first = Vec::new();
+        ssh3_proto::append_var_int(&mut first, 42);
+        first.extend_from_slice(&[1, 2, 3]);
+        let mut second = Vec::new();
+        ssh3_proto::append_var_int(&mut second, 42);
+        second.extend_from_slice(&[4, 5, 6]);
+
+        let _ = conversation.add_datagram(&first).await;
+        let _ = conversation.add_datagram(&second).await;
+
+        let (recv, _) = BytesReceiveStream::new(Vec::new());
+        let (send, _) = RecordingSendStream::new();
+        let channel = conversation.open_channel(42, b"session".to_vec(), 1024, 8, recv, send);
+
+        assert_eq!(channel.receive_datagram().await, vec![1, 2, 3]);
+        assert_eq!(channel.receive_datagram().await, vec![4, 5, 6]);
     }
 
     #[tokio::test]

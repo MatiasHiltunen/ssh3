@@ -11,4 +11,4 @@ members = [
 resolver = "3"
 
 [patch.crates-io]
-h3 = { path = "vendor/h3" }
+h3 = { path = "third_party/rust/h3" }

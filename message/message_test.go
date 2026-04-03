@@ -16,7 +16,11 @@ var _ = Describe("Messages", func() {
 	const CHANNEL_OPEN_FAILURE = 92
 	const CLASSICAL_DATA = 94
 	const EXTENDED_DATA = 95
+	const CHANNEL_EOF = 96
+	const CHANNEL_CLOSE = 97
 	const CHANNEL_REQUEST = 98
+	const CHANNEL_SUCCESS = 99
+	const CHANNEL_FAILURE = 100
 	const EXTENDED_DATA_TYPE = 10000000
 	small_message_data := "hello, world!"
 	empty_message_data := ""
@@ -176,6 +180,81 @@ var _ = Describe("Messages", func() {
 				Expect(err).To(BeNil())
 				Expect(n).To(BeEquivalentTo(len(buf)))
 				Expect(buf).To(Equal(large_binary_extended_message))
+			})
+		})
+	})
+
+	Context("Channel control messages", func() {
+		channelEOFBinary := util.AppendVarInt(nil, CHANNEL_EOF)
+		channelCloseBinary := util.AppendVarInt(nil, CHANNEL_CLOSE)
+		channelSuccessBinary := util.AppendVarInt(nil, CHANNEL_SUCCESS)
+		channelFailureBinary := util.AppendVarInt(nil, CHANNEL_FAILURE)
+
+		Context("Parsing", func() {
+			It("Parses channel EOF", func() {
+				r := bytes.NewReader(channelEOFBinary)
+				msg, err := ParseMessage(&util.BytesReadCloser{Reader: r})
+				Expect(err).To(BeNil())
+				Expect(msg).To(Equal(&ChannelEOFMessage{}))
+			})
+
+			It("Parses channel close", func() {
+				r := bytes.NewReader(channelCloseBinary)
+				msg, err := ParseMessage(&util.BytesReadCloser{Reader: r})
+				Expect(err).To(BeNil())
+				Expect(msg).To(Equal(&ChannelCloseMessage{}))
+			})
+
+			It("Parses channel success", func() {
+				r := bytes.NewReader(channelSuccessBinary)
+				msg, err := ParseMessage(&util.BytesReadCloser{Reader: r})
+				Expect(err).To(BeNil())
+				Expect(msg).To(Equal(&ChannelSuccessMessage{}))
+			})
+
+			It("Parses channel failure", func() {
+				r := bytes.NewReader(channelFailureBinary)
+				msg, err := ParseMessage(&util.BytesReadCloser{Reader: r})
+				Expect(err).To(BeNil())
+				Expect(msg).To(Equal(&ChannelFailureMessage{}))
+			})
+		})
+
+		Context("Writing", func() {
+			It("Writes channel EOF", func() {
+				msg := &ChannelEOFMessage{}
+				buf := make([]byte, msg.Length())
+				n, err := msg.Write(buf)
+				Expect(err).To(BeNil())
+				Expect(n).To(BeEquivalentTo(len(buf)))
+				Expect(buf).To(Equal(channelEOFBinary))
+			})
+
+			It("Writes channel close", func() {
+				msg := &ChannelCloseMessage{}
+				buf := make([]byte, msg.Length())
+				n, err := msg.Write(buf)
+				Expect(err).To(BeNil())
+				Expect(n).To(BeEquivalentTo(len(buf)))
+				Expect(buf).To(Equal(channelCloseBinary))
+			})
+
+			It("Writes channel success", func() {
+				msg := &ChannelSuccessMessage{}
+				buf := make([]byte, msg.Length())
+				n, err := msg.Write(buf)
+				Expect(err).To(BeNil())
+				Expect(n).To(BeEquivalentTo(len(buf)))
+				Expect(buf).To(Equal(channelSuccessBinary))
+			})
+
+			It("Writes channel failure", func() {
+				msg := &ChannelFailureMessage{}
+				buf := make([]byte, msg.Length())
+				n, err := msg.Write(buf)
+				Expect(err).To(BeNil())
+				Expect(n).To(BeEquivalentTo(len(buf)))
+				Expect(buf).To(Equal(channelFailureBinary))
 			})
 		})
 	})
