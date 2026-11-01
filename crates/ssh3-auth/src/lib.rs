@@ -5,19 +5,21 @@ use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use p256::EncodedPoint as P256EncodedPoint;
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };
 use rsa::pkcs1v15::{
     Signature as RsaSignature, SigningKey as RsaSigningKey, VerifyingKey as RsaVerifyingKey,
 };
+use rsa::sha2::Sha256;
+use rsa::signature::{
+    RandomizedSigner, SignatureEncoding, Signer as RsaSigner, Verifier as RsaVerifier,
+};
 use rsa::{
     BigUint as RsaBigUint, RsaPrivateKey as JwtRsaPrivateKey, RsaPublicKey as JwtRsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use signature::{SignatureEncoding, Signer, Verifier};
+use signature::{Signer, Verifier};
 use ssh_key::authorized_keys::Entry as AuthorizedKeyEntry;
 use ssh_key::private::{EcdsaKeypair, KeypairData, RsaKeypair};
 use ssh_key::public::{EcdsaPublicKey, KeyData, RsaPublicKey};
@@ -338,7 +340,7 @@ pub fn verify_bearer_token(
     if claims.iat > now {
         return Err(AuthError::InvalidToken("JWT issued-at is in the future"));
     }
-    if claims.exp < now {
+    if claims.exp <= now {
         return Err(AuthError::InvalidToken("JWT is expired"));
     }
 
@@ -375,7 +377,7 @@ pub async fn verify_oidc_identity_token(
     if !claims.aud.contains(&identity.client_id) {
         return Err(AuthError::InvalidToken("unexpected OIDC audience"));
     }
-    if claims.exp < now {
+    if claims.exp <= now {
         return Err(AuthError::InvalidToken("OIDC token is expired"));
     }
     if claims.email.as_deref() != Some(identity.email.as_str()) {
@@ -444,7 +446,7 @@ fn sign_jwt_signature(
 ) -> Result<Vec<u8>, AuthError> {
     match jwt_algorithm {
         JwtAlgorithm::EdDsa => {
-            let signature = Signer::try_sign(private_key, signing_input)
+            let signature = RsaSigner::try_sign(private_key, signing_input)
                 .map_err(|_| AuthError::InvalidToken("could not sign bearer token"))?;
             Ok(signature.as_bytes().to_vec())
         }
@@ -475,7 +477,10 @@ fn sign_jwt_signature(
                     ));
                 }
             };
-            let signature: RsaSignature = Signer::try_sign(&signing_key, signing_input)
+            // Blind the private RSA operation. The upstream timing advisory still
+            // applies; this is defense in depth rather than a complete fix.
+            let signature: RsaSignature = signing_key
+                .try_sign_with_rng(&mut rsa::rand_core::OsRng, signing_input)
                 .map_err(|_| AuthError::InvalidToken("could not sign bearer token"))?;
             Ok(signature.to_vec())
         }
@@ -491,7 +496,7 @@ fn verify_jwt_signature(
     match jwt_algorithm {
         JwtAlgorithm::EdDsa => {
             let signature = Signature::new(Algorithm::Ed25519, signature_bytes.to_vec())?;
-            Verifier::verify(public_key, signing_input, &signature)
+            RsaVerifier::verify(public_key, signing_input, &signature)
                 .map_err(|_| AuthError::InvalidToken("JWT signature verification failed"))
         }
         JwtAlgorithm::Es256 => {
@@ -499,7 +504,7 @@ fn verify_jwt_signature(
                 KeyData::Ecdsa(ecdsa_public_key)
                     if ecdsa_public_key.curve() == EcdsaCurve::NistP256 =>
                 {
-                    P256VerifyingKey::try_from(ecdsa_public_key)
+                    P256VerifyingKey::from_sec1_bytes(ecdsa_public_key.as_ref())
                         .map_err(|_| AuthError::InvalidKeyMaterial("invalid P-256 public key"))?
                 }
                 _ => {
@@ -712,12 +717,11 @@ fn verify_oidc_jwk_signature(
                     "invalid P-256 public key coordinates",
                 ));
             }
-            let point = P256EncodedPoint::from_affine_coordinates(
-                x.as_slice().into(),
-                y.as_slice().into(),
-                false,
-            );
-            let verifying_key = P256VerifyingKey::from_encoded_point(&point)
+            let mut point = [0u8; 65];
+            point[0] = 4; // SEC1 uncompressed point: tag followed by x and y.
+            point[1..33].copy_from_slice(&x);
+            point[33..].copy_from_slice(&y);
+            let verifying_key = P256VerifyingKey::from_sec1_bytes(&point)
                 .map_err(|_| AuthError::InvalidKeyMaterial("invalid P-256 public key"))?;
             let signature = P256Signature::from_slice(signature_bytes)
                 .map_err(|_| AuthError::InvalidToken("malformed ES256 signature"))?;
@@ -731,19 +735,20 @@ fn verify_oidc_jwk_signature(
 
 #[cfg(test)]
 mod tests {
+    include!("../tests/support/p256_key.rs");
+
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use p256::SecretKey as P256SecretKey;
-    use rand_core::OsRng;
     use rsa::RsaPrivateKey;
     use rsa::pkcs1v15::{Signature as RsaSignature, SigningKey as RsaSigningKey};
+    use rsa::rand_core::OsRng;
+    use rsa::sha2::Sha256;
+    use rsa::signature::{SignatureEncoding, Signer};
     use rsa::traits::PublicKeyParts;
-    use sha2::Sha256;
-    use signature::{SignatureEncoding, Signer};
     use ssh_key::LineEnding;
-    use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, RsaKeypair};
+    use ssh_key::private::{Ed25519Keypair, RsaKeypair};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -881,17 +886,107 @@ mod tests {
     }
 
     #[test]
+    fn bearer_tokens_reject_wrong_keys_users_and_conversations() {
+        let private_key = ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
+        let other_key = ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[8; 32]));
+        let conversation_id = [9u8; 32];
+        let token = build_bearer_token(&private_key, "alice", &conversation_id).unwrap();
+        assert!(
+            verify_bearer_token(other_key.public_key(), &token, "alice", &conversation_id).is_err()
+        );
+        assert!(
+            verify_bearer_token(
+                private_key.public_key(),
+                &token,
+                "mallory",
+                &conversation_id
+            )
+            .is_err()
+        );
+        assert!(verify_bearer_token(private_key.public_key(), &token, "alice", &[10; 32]).is_err());
+
+        let (input, _) = token.rsplit_once('.').unwrap();
+        let tampered = format!("{input}.{}", URL_SAFE_NO_PAD.encode([0u8; 64]));
+        assert!(
+            verify_bearer_token(
+                private_key.public_key(),
+                &tampered,
+                "alice",
+                &conversation_id
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn signed_bearer_tokens_reject_expired_and_invalid_claims() {
+        let private_key = ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
+        let conversation_id = [9u8; 32];
+        let token = build_bearer_token(&private_key, "alice", &conversation_id).unwrap();
+        let (header, rest) = token.split_once('.').unwrap();
+        let (claims, _) = rest.split_once('.').unwrap();
+        let original: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(claims).unwrap()).unwrap();
+        for (field, value) in [
+            (
+                "exp",
+                serde_json::json!(super::unix_timestamp_now().unwrap()),
+            ),
+            ("iat", serde_json::json!(u64::MAX)),
+            ("aud", serde_json::json!("another-service")),
+            ("sub", serde_json::json!("another-protocol")),
+        ] {
+            let mut claims = original.clone();
+            claims[field] = value;
+            let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+            let input = format!("{header}.{claims}");
+            let signature = super::sign_jwt_signature(
+                &private_key,
+                super::JwtAlgorithm::EdDsa,
+                input.as_bytes(),
+            )
+            .unwrap();
+            let token = format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature));
+            assert!(
+                verify_bearer_token(private_key.public_key(), &token, "alice", &conversation_id)
+                    .is_err(),
+                "accepted invalid {field}"
+            );
+        }
+    }
+
+    #[test]
     fn nist_p256_bearer_tokens_round_trip() {
-        let secret_key = P256SecretKey::from_slice(&[11; 32]).unwrap();
-        let private_key = ssh_key::PrivateKey::from(EcdsaKeypair::NistP256 {
-            public: secret_key.public_key().into(),
-            private: secret_key.into(),
-        });
+        let private_key = test_p256_private_key();
         let public_key = private_key.public_key().clone();
         let conversation_id = [5u8; 32];
 
         let token = build_bearer_token(&private_key, "alice", &conversation_id).unwrap();
         verify_bearer_token(&public_key, &token, "alice", &conversation_id).unwrap();
+    }
+
+    #[test]
+    fn oidc_es256_signatures_validate_with_the_current_p256_backend() {
+        let key = p256::ecdsa::SigningKey::from_slice(&[11; 32]).unwrap();
+        let point = key.verifying_key().to_sec1_point(false);
+        let mut jwk: super::OidcJwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-256", "alg": "ES256",
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }))
+        .unwrap();
+        let input = b"oidc-test-signing-input";
+        let signature: p256::ecdsa::Signature = signature::Signer::try_sign(&key, input).unwrap();
+        super::verify_oidc_jwk_signature(&jwk, "ES256", input, &signature.to_bytes()).unwrap();
+        assert!(
+            super::verify_oidc_jwk_signature(&jwk, "ES256", b"tampered", &signature.to_bytes())
+                .is_err()
+        );
+        jwk.x = Some(URL_SAFE_NO_PAD.encode([0u8; 31]));
+        assert!(matches!(
+            super::verify_oidc_jwk_signature(&jwk, "ES256", input, &signature.to_bytes()),
+            Err(super::AuthError::InvalidKeyMaterial(_))
+        ));
     }
 
     #[test]
@@ -909,11 +1004,7 @@ mod tests {
     #[test]
     fn authorized_keys_lines_are_parsed() {
         let private_key = ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[3; 32]));
-        let p256_secret_key = P256SecretKey::from_slice(&[17; 32]).unwrap();
-        let p256_private_key = ssh_key::PrivateKey::from(EcdsaKeypair::NistP256 {
-            public: p256_secret_key.public_key().into(),
-            private: p256_secret_key.into(),
-        });
+        let p256_private_key = test_p256_private_key();
         let rsa_private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
         let rsa_private_key =
             ssh_key::PrivateKey::from(RsaKeypair::try_from(&rsa_private_key).unwrap());

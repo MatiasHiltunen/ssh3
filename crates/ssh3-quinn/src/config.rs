@@ -189,3 +189,49 @@ impl ServerCertVerifier for SkipServerVerification {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    async fn rejected_handshake(trust_certificate: bool, server_name: &str) {
+        let (server_config, certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let _ = incoming.await;
+        });
+
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let config = if trust_certificate {
+            client_config_for_certificate(certificate).unwrap()
+        } else {
+            client_config_with_roots(RootCertStore::empty()).unwrap()
+        };
+        client.set_default_client_config(config);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.connect(address, server_name).unwrap(),
+        )
+        .await
+        .expect("TLS rejection should finish promptly")
+        .unwrap_err();
+        assert!(error.to_string().contains("certificate"), "{error}");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_untrusted_server_certificates() {
+        rejected_handshake(false, "localhost").await;
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_incorrect_server_names() {
+        rejected_handshake(true, "wrong.example").await;
+    }
+}

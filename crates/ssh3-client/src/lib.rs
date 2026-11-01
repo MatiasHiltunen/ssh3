@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt;
 use std::future::poll_fn;
-use std::io::{self, BufReader};
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
@@ -11,12 +11,14 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use http::{Uri, header::HeaderValue};
 #[cfg(unix)]
 use nix::sys::termios::{self, SetArg};
 use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use reqwest::StatusCode as HttpStatusCode;
+use rustls::pki_types::pem::PemObject;
 use rustls::{RootCertStore, pki_types::CertificateDer};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -411,7 +413,7 @@ impl From<http::header::InvalidHeaderValue> for ClientError {
 }
 
 struct ResolvedTarget {
-    remote_addr: SocketAddr,
+    remote_addrs: Vec<SocketAddr>,
     server_name: String,
 }
 
@@ -456,10 +458,9 @@ pub fn load_certificates(
 ) -> Result<Vec<CertificateDer<'static>>, ClientError> {
     let bytes = std::fs::read(path).map_err(ClientError::Io)?;
     if bytes.starts_with(b"-----BEGIN") {
-        let mut reader = BufReader::new(bytes.as_slice());
-        let certificates = rustls_pemfile::certs(&mut reader)
+        let certificates = CertificateDer::pem_slice_iter(&bytes)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(ClientError::Io)?;
+            .map_err(|error| ClientError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
         if certificates.is_empty() {
             return Err(ClientError::InvalidCertificateBundle);
         }
@@ -773,10 +774,12 @@ fn try_open_browser(url: &str) -> bool {
     false
 }
 
-fn random_urlsafe(bytes_len: usize) -> String {
+fn random_urlsafe(bytes_len: usize) -> Result<String, OidcError> {
     let mut bytes = vec![0u8; bytes_len];
-    OsRng.fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(io::Error::other)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn oidc_code_challenge(verifier: &str) -> String {
@@ -829,51 +832,49 @@ async fn wait_for_oidc_callback(
         )
     }
 
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        let request = read_http_request(&mut stream).await?;
-        let target = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .ok_or(OidcError::InvalidResponse(
-                "malformed OIDC callback request",
-            ))?;
-        let callback_url = Url::parse(&format!("http://localhost{target}"))?;
-        let mut code = None;
-        let mut state = None;
-        let mut provider_error = None;
-        for (key, value) in callback_url.query_pairs() {
-            match key.as_ref() {
-                "code" => code = Some(value.into_owned()),
-                "state" => state = Some(value.into_owned()),
-                "error" => provider_error = Some(value.into_owned()),
-                _ => {}
-            }
+    let (mut stream, _) = listener.accept().await?;
+    let request = read_http_request(&mut stream).await?;
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or(OidcError::InvalidResponse(
+            "malformed OIDC callback request",
+        ))?;
+    let callback_url = Url::parse(&format!("http://localhost{target}"))?;
+    let mut code = None;
+    let mut state = None;
+    let mut provider_error = None;
+    for (key, value) in callback_url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            "error" => provider_error = Some(value.into_owned()),
+            _ => {}
         }
-
-        if let Some(provider_error) = provider_error {
-            let response =
-                callback_response("HTTP/1.1 400 Bad Request", "OIDC authentication failed.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::ProviderError(provider_error));
-        }
-        if state.as_deref() != Some(expected_state) {
-            let response = callback_response("HTTP/1.1 400 Bad Request", "OIDC state mismatch.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::InvalidResponse("OIDC state mismatch"));
-        }
-        let Some(code) = code else {
-            let response =
-                callback_response("HTTP/1.1 400 Bad Request", "OIDC callback missing code.\n");
-            let _ = stream.write_all(response.as_bytes()).await;
-            return Err(OidcError::InvalidResponse("OIDC callback missing code"));
-        };
-
-        let response = callback_response("HTTP/1.1 200 OK", "you can now close this tab");
-        let _ = stream.write_all(response.as_bytes()).await;
-        return Ok(code);
     }
+
+    if let Some(provider_error) = provider_error {
+        let response =
+            callback_response("HTTP/1.1 400 Bad Request", "OIDC authentication failed.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(OidcError::ProviderError(provider_error));
+    }
+    if state.as_deref() != Some(expected_state) {
+        let response = callback_response("HTTP/1.1 400 Bad Request", "OIDC state mismatch.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(OidcError::InvalidResponse("OIDC state mismatch"));
+    }
+    let Some(code) = code else {
+        let response =
+            callback_response("HTTP/1.1 400 Bad Request", "OIDC callback missing code.\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        return Err(OidcError::InvalidResponse("OIDC callback missing code"));
+    };
+
+    let response = callback_response("HTTP/1.1 200 OK", "you can now close this tab");
+    let _ = stream.write_all(response.as_bytes()).await;
+    Ok(code)
 }
 
 async fn exchange_oidc_code(
@@ -924,8 +925,8 @@ async fn authenticate_oidc_with_browser_opener(
         "http://127.0.0.1:{}{OIDC_CALLBACK_PATH}",
         listener.local_addr()?.port()
     );
-    let state = random_urlsafe(24);
-    let code_verifier = oidc.use_pkce.then(|| random_urlsafe(48));
+    let state = random_urlsafe(24)?;
+    let code_verifier = oidc.use_pkce.then(|| random_urlsafe(48)).transpose()?;
     let mut auth_url = Url::parse(&discovery.authorization_endpoint)?;
     {
         let mut query = auth_url.query_pairs_mut();
@@ -1082,16 +1083,7 @@ async fn connect_client_with_browser_opener(
 ) -> Result<ActiveClient, ClientError> {
     let precomputed_authorization = precomputed_authorization_header(config).await?;
 
-    let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
-    let bind_addr = client_bind_addr(resolved.remote_addr);
-    let mut endpoint = Endpoint::client(bind_addr).map_err(ClientError::Endpoint)?;
-    endpoint.set_default_client_config(client_quinn_config(&config.trust)?);
-
-    let connection = endpoint
-        .connect(resolved.remote_addr, &resolved.server_name)
-        .map_err(ClientError::Connect)?
-        .await
-        .map_err(ClientError::Connection)?;
+    let (endpoint, connection) = connect_target(config).await?;
 
     let (mut driver, mut send_request) = new_client(connection.clone()).await?;
     let driver_task = tokio::spawn(async move {
@@ -1190,21 +1182,75 @@ async fn resolve_target(
     server_name_override: Option<&str>,
 ) -> Result<ResolvedTarget, ClientError> {
     let host = uri.host().ok_or(ClientError::MissingHost)?;
-    let remote_addr = tokio::net::lookup_host((host, uri.port_u16().unwrap_or(443)))
+    let remote_addrs: Vec<_> = tokio::net::lookup_host((host, uri.port_u16().unwrap_or(443)))
         .await
         .map_err(ClientError::Resolve)?
-        .next()
-        .ok_or_else(|| {
-            ClientError::Resolve(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "target host did not resolve to an address",
-            ))
-        })?;
+        .collect();
+    if remote_addrs.is_empty() {
+        return Err(ClientError::Resolve(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "target host did not resolve to an address",
+        )));
+    }
 
     Ok(ResolvedTarget {
-        remote_addr,
+        remote_addrs,
         server_name: server_name_override.unwrap_or(host).to_string(),
     })
+}
+
+async fn connect_target(config: &ClientConfig) -> Result<(Endpoint, Connection), ClientError> {
+    let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
+    connect_resolved_target(resolved, &config.trust).await
+}
+
+async fn connect_resolved_target(
+    resolved: ResolvedTarget,
+    trust: &TrustStrategy,
+) -> Result<(Endpoint, Connection), ClientError> {
+    let quinn_config = client_quinn_config(trust)?;
+    let mut attempts = FuturesUnordered::new();
+    let mut last_error = None;
+    for remote_addr in resolved.remote_addrs {
+        let mut endpoint = match Endpoint::client(client_bind_addr(remote_addr)) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                last_error = Some(ClientError::Endpoint(error));
+                continue;
+            }
+        };
+        endpoint.set_default_client_config(quinn_config.clone());
+        let connecting = endpoint
+            .connect(remote_addr, &resolved.server_name)
+            .map_err(ClientError::Connect)?;
+        attempts.push(async move {
+            let connection = connecting.await.map_err(ClientError::Connection)?;
+            Ok((endpoint, connection))
+        });
+    }
+    // Race addresses so an unreachable address family cannot stall a working one.
+    // Dropping the other attempts also drops and closes their endpoints.
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(connection) => return Ok(connection),
+            Err(ClientError::Connection(ConnectionError::TransportError(error)))
+                if (0x100..0x200).contains(&u64::from(error.code)) =>
+            {
+                // Authentication failures are fatal; preserve the TLS error
+                // instead of waiting for an unreachable alternative address.
+                return Err(ClientError::Connection(ConnectionError::TransportError(
+                    error,
+                )));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ClientError::Resolve(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no usable target address",
+        ))
+    }))
 }
 
 fn client_bind_addr(remote_addr: SocketAddr) -> SocketAddr {
@@ -1500,6 +1546,8 @@ async fn forward_agent_channel(
 
 #[cfg(test)]
 mod tests {
+    include!("../../ssh3-auth/tests/support/p256_key.rs");
+
     use std::fs;
     #[cfg(unix)]
     use std::fs::File as StdFile;
@@ -1524,16 +1572,14 @@ mod tests {
     use nix::pty::{Winsize, openpty};
     #[cfg(unix)]
     use nix::unistd::{Uid, User};
-    use p256::SecretKey as P256SecretKey;
-    use quinn::Endpoint;
-    use rand_core::OsRng;
     use rsa::BigUint as RsaBigUint;
     use rsa::RsaPrivateKey as JwtRsaPrivateKey;
     use rsa::pkcs1v15::{Signature as RsaSignature, SigningKey as RsaSigningKey};
+    use rsa::rand_core::OsRng;
+    use rsa::sha2::Sha256;
+    use rsa::signature::{SignatureEncoding, Signer};
     use rsa::traits::PublicKeyParts;
-    use sha2::Sha256;
-    use signature::{SignatureEncoding, Signer};
-    use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair};
+    use ssh_key::private::{Ed25519Keypair, KeypairData, RsaKeypair};
     use ssh_key::{Algorithm, HashAlg, Signature};
     use ssh3_auth::bearer_authorization_value;
     use ssh3_core::Channel;
@@ -1563,9 +1609,8 @@ mod tests {
     use super::{
         CapturedSession, ClientConfig, ClientError, LocalTerminalInfo, OidcConfig, OidcError,
         SessionRequest, TerminalSize, TrustStrategy, activate_client, build_session_runtime,
-        client_bind_addr, client_quinn_config, connect_client, conversation_id_base64,
-        resolve_target, run_capture_on_client, run_exec_capture,
-        run_exec_capture_with_browser_opener, send_forward_agent_request,
+        connect_client, connect_target, conversation_id_base64, run_capture_on_client,
+        run_exec_capture, run_exec_capture_with_browser_opener, send_forward_agent_request,
         send_initial_session_requests, send_signal_request, send_window_change_request,
     };
 
@@ -1644,16 +1689,7 @@ mod tests {
         config: &ClientConfig,
         authorization_builder: impl FnOnce(&[u8; 32]) -> String,
     ) -> Result<super::ActiveClient, ClientError> {
-        let resolved = resolve_target(&config.target_url, config.server_name.as_deref()).await?;
-        let bind_addr = client_bind_addr(resolved.remote_addr);
-        let mut endpoint = Endpoint::client(bind_addr).map_err(ClientError::Endpoint)?;
-        endpoint.set_default_client_config(client_quinn_config(&config.trust)?);
-
-        let connection = endpoint
-            .connect(resolved.remote_addr, &resolved.server_name)
-            .map_err(ClientError::Connect)?
-            .await
-            .map_err(ClientError::Connection)?;
+        let (endpoint, connection) = connect_target(config).await?;
 
         let (mut driver, mut send_request) = new_client(connection.clone()).await?;
         let driver_task = tokio::spawn(async move {
@@ -1734,13 +1770,7 @@ mod tests {
             AuthKeyAlgorithm::Ed25519 => {
                 ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[31; 32]))
             }
-            AuthKeyAlgorithm::NistP256 => {
-                let secret_key = P256SecretKey::from_slice(&[29; 32]).unwrap();
-                ssh_key::PrivateKey::from(EcdsaKeypair::NistP256 {
-                    public: secret_key.public_key().into(),
-                    private: secret_key.into(),
-                })
-            }
+            AuthKeyAlgorithm::NistP256 => test_p256_private_key(),
             AuthKeyAlgorithm::Rsa => {
                 let rsa_private_key = JwtRsaPrivateKey::new(&mut OsRng, 2048).unwrap();
                 ssh_key::PrivateKey::from(RsaKeypair::try_from(&rsa_private_key).unwrap())
@@ -3510,6 +3540,156 @@ mod tests {
         );
 
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_tries_remaining_resolved_addresses() {
+        let (server_config, certificate) =
+            self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let target = super::ResolvedTarget {
+            remote_addrs: vec![
+                std::net::SocketAddr::new("::1".parse().unwrap(), server_addr.port()),
+                server_addr,
+            ],
+            server_name: "localhost".to_string(),
+        };
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            connection.closed().await;
+        });
+        let (endpoint, connection) = timeout(
+            Duration::from_secs(5),
+            super::connect_resolved_target(target, &TrustStrategy::Certificates(vec![certificate])),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(connection.remote_address(), server_addr);
+        connection.close(0u32.into(), b"done");
+        endpoint.wait_idle().await;
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_failure_does_not_wait_for_unreachable_addresses() {
+        let (tls, _) = self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server = quinn::Endpoint::server(tls, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let target = super::ResolvedTarget {
+            remote_addrs: vec![
+                std::net::SocketAddr::new("::1".parse().unwrap(), address.port()),
+                address,
+            ],
+            server_name: "localhost".to_string(),
+        };
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let _ = incoming.await;
+        });
+        let error = timeout(
+            Duration::from_secs(5),
+            super::connect_resolved_target(target, &TrustStrategy::WebPkiRoots),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("certificate"), "{error}");
+        server_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authenticated_tcp_and_udp_forwarding_round_trip_against_the_rust_server() {
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let config = ServerConfig {
+            require_authentication: true,
+            authorized_identity_paths: vec![fixture.authorized_identities_path.clone()],
+            ..ServerConfig::default()
+        };
+        let (tls, certificate) = self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let server = quinn::Endpoint::server(tls, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            serve_connection(connection, config).await.unwrap();
+        });
+
+        let mut config = ClientConfig::new(
+            format!("https://localhost:{}/ssh3-term", address.port())
+                .parse()
+                .unwrap(),
+        );
+        config.username = Some(fixture.username.clone());
+        config.identity_file = Some(fixture.private_key_path.clone());
+        config.trust = TrustStrategy::Certificates(vec![certificate]);
+        let client = timeout(Duration::from_secs(5), connect_client(&config))
+            .await
+            .unwrap()
+            .unwrap();
+        let (tcp_address, tcp_task) = spawn_tcp_echo_server().await;
+        let (udp_address, udp_task) = spawn_udp_echo_server().await;
+        let tcp_payload = b"authenticated Rust TCP forwarding";
+        let udp_payload = b"authenticated Rust UDP forwarding";
+        assert_eq!(
+            run_tcp_forwarding_round_trip_on_client(&client, tcp_address, tcp_payload)
+                .await
+                .unwrap(),
+            tcp_payload
+        );
+        assert_eq!(
+            run_udp_forwarding_round_trip_on_client(&client, udp_address, udp_payload)
+                .await
+                .unwrap(),
+            udp_payload
+        );
+        client.shutdown().await;
+        timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        tcp_task.abort();
+        udp_task.abort();
+    }
+
+    #[test]
+    fn certificate_files_accept_der_and_pem_bundles_and_reject_malformed_pem() {
+        let (_, certificate) = self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().join("certificate");
+        fs::write(&path, certificate.as_ref()).unwrap();
+        assert_eq!(
+            super::load_certificates(&path).unwrap(),
+            vec![certificate.clone()]
+        );
+
+        let pem = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            super::BASE64_STANDARD.encode(certificate.as_ref())
+        );
+        fs::write(&path, pem.repeat(2)).unwrap();
+        assert_eq!(
+            super::load_certificates(&path).unwrap(),
+            vec![certificate.clone(), certificate]
+        );
+
+        fs::write(
+            &path,
+            b"-----BEGIN CERTIFICATE-----\n!invalid!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(super::load_certificates(&path).is_err());
+        fs::write(
+            &path,
+            b"-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            super::load_certificates(&path),
+            Err(ClientError::InvalidCertificateBundle)
+        ));
     }
 
     #[cfg(unix)]

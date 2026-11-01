@@ -273,29 +273,25 @@ impl Channel {
             return Ok(());
         }
 
-        loop {
-            let message = {
-                let mut recv = self.recv.lock().await;
-                parse_message(recv.as_mut()).await?
-            };
+        let message = {
+            let mut recv = self.recv.lock().await;
+            parse_message(recv.as_mut()).await?
+        };
 
-            match message {
-                Message::ChannelOpenConfirmation(_) => {
-                    self.confirm_received.store(true, Ordering::SeqCst);
-                    return Ok(());
-                }
-                Message::ChannelOpenFailure(message) => {
-                    return Err(ChannelError::OpenFailure(ChannelOpenFailure {
-                        reason_code: message.reason_code,
-                        error_message_utf8: message.error_message_utf8,
-                    }));
-                }
-                other => {
-                    return Err(ChannelError::NonConfirmed(MessageOnNonConfirmedChannel {
-                        message: other,
-                    }));
-                }
+        match message {
+            Message::ChannelOpenConfirmation(_) => {
+                self.confirm_received.store(true, Ordering::SeqCst);
+                Ok(())
             }
+            Message::ChannelOpenFailure(message) => {
+                Err(ChannelError::OpenFailure(ChannelOpenFailure {
+                    reason_code: message.reason_code,
+                    error_message_utf8: message.error_message_utf8,
+                }))
+            }
+            other => Err(ChannelError::NonConfirmed(MessageOnNonConfirmedChannel {
+                message: other,
+            })),
         }
     }
 
@@ -593,8 +589,7 @@ async fn read_var_int(recv: &mut dyn ReceiveStream) -> Result<u64, ChannelError>
 
 async fn read_ssh_bytes(recv: &mut dyn ReceiveStream) -> Result<Vec<u8>, ChannelError> {
     let len = read_var_int(recv).await?;
-    let len = usize::try_from(len)
-        .map_err(|_| ChannelError::Proto(ssh3_proto::Error::InvalidLength(len)))?;
+    let len = ssh3_proto::checked_ssh_string_length(len)?;
     let mut out = vec![0; len];
     recv.read_exact(&mut out).await?;
     Ok(out)
@@ -631,6 +626,19 @@ mod tests {
 
     fn conversation_id() -> [u8; 32] {
         [7; 32]
+    }
+
+    #[tokio::test]
+    async fn oversized_ssh_strings_are_rejected_before_allocation() {
+        for length in [ssh3_proto::MAX_SSH_STRING_LEN + 1, ssh3_proto::MAX_VARINT] {
+            let mut encoded = Vec::new();
+            append_var_int(&mut encoded, length);
+            let (mut recv, _) = BytesReceiveStream::new(encoded);
+            assert!(matches!(
+                super::read_ssh_bytes(&mut recv).await,
+                Err(ChannelError::Proto(ssh3_proto::Error::InvalidLength(value))) if value == length
+            ));
+        }
     }
 
     #[tokio::test]

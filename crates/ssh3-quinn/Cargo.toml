@@ -10,14 +10,14 @@ description = "Quinn transport bindings for the Rust SSH3 runtime"
 path = "src/lib.rs"
 
 [dependencies]
-async-trait = "0.1.89"
-bytes = "1.10.1"
-quinn = "0.11.9"
-rcgen = "0.14.7"
-rustls = "0.23.35"
+async-trait = "0.1.92"
+bytes = "1.12.1"
+quinn = "0.11.12"
+rcgen = "0.14.10"
+rustls = "0.23.46"
 ssh3-core = { path = "../ssh3-core" }
 ssh3-proto = { path = "../ssh3-proto" }
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.11"
 
 [dev-dependencies]
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time"] }

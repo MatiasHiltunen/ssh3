@@ -4,6 +4,9 @@ use std::io::{self, Read};
 pub const MIN_VARINT: u64 = 0;
 pub const MAX_VARINT: u64 = MAX_VARINT_8;
 
+/// Resource limit for a single incoming SSH string, in every transport reader.
+pub const MAX_SSH_STRING_LEN: u64 = 16 * 1024 * 1024;
+
 const MAX_VARINT_1: u64 = 63;
 const MAX_VARINT_2: u64 = 16_383;
 const MAX_VARINT_4: u64 = 1_073_741_823;
@@ -28,7 +31,7 @@ impl fmt::Display for Error {
             Self::Io(err) => write!(f, "{err}"),
             Self::InvalidBool(value) => write!(f, "invalid SSH boolean byte: {value}"),
             Self::InvalidLength(length) => {
-                write!(f, "SSH string length does not fit in memory: {length}")
+                write!(f, "SSH string length exceeds the supported limit: {length}")
             }
             Self::UnknownMessageType(kind) => write!(f, "unknown SSH message type: {kind}"),
             Self::UnknownRequestType(kind) => {
@@ -167,10 +170,18 @@ pub fn var_int_len(value: u64) -> usize {
 
 pub fn read_ssh_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
     let length = read_var_int(reader)?;
-    let length = usize::try_from(length).map_err(|_| Error::InvalidLength(length))?;
+    let length = checked_ssh_string_length(length)?;
     let mut out = vec![0; length];
     reader.read_exact(&mut out)?;
     Ok(out)
+}
+
+/// Validate an untrusted wire length before allocating its buffer.
+pub fn checked_ssh_string_length(length: u64) -> Result<usize> {
+    if length > MAX_SSH_STRING_LEN {
+        return Err(Error::InvalidLength(length));
+    }
+    usize::try_from(length).map_err(|_| Error::InvalidLength(length))
 }
 
 pub fn append_ssh_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -261,6 +272,23 @@ mod tests {
         let mut cursor = Cursor::new(encoded);
         let decoded = read_ssh_bytes(&mut cursor).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn oversized_ssh_strings_are_rejected_before_allocation() {
+        for length in [super::MAX_SSH_STRING_LEN + 1, MAX_VARINT] {
+            let mut encoded = Vec::new();
+            append_var_int(&mut encoded, length);
+            assert!(matches!(
+                read_ssh_bytes(&mut Cursor::new(encoded)),
+                Err(super::Error::InvalidLength(value)) if value == length
+            ));
+        }
+        assert_eq!(super::checked_ssh_string_length(0).unwrap(), 0);
+        assert_eq!(
+            super::checked_ssh_string_length(super::MAX_SSH_STRING_LEN).unwrap(),
+            super::MAX_SSH_STRING_LEN as usize
+        );
     }
 
     #[test]

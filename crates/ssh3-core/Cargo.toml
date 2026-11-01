@@ -10,7 +10,7 @@ description = "Rust SSH3 conversation and channel runtime"
 path = "src/lib.rs"
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 ssh3-proto = { path = "../ssh3-proto" }
-tokio = { version = "1.48.0", features = ["io-util", "macros", "rt", "sync"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "rt", "sync"] }
 
