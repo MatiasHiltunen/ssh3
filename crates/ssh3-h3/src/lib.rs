@@ -931,8 +931,6 @@ mod tests {
                 .unwrap();
         };
 
-        let (server_result, client_result) = tokio::join!(server_task, client_task);
-        let _ = server_result;
-        let _ = client_result;
+        tokio::join!(server_task, client_task);
     }
 }

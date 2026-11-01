@@ -1,0 +1,20 @@
+[
+  {
+    "check": "authenticated_exec",
+    "exit_code": 0,
+    "stdout": "release-smoke-ok\n",
+    "stderr": ""
+  },
+  {
+    "check": "missing_authentication_rejected",
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "ssh3-client failed: Connection error: Remote error: ApplicationClose: H3_NO_ERROR\n"
+  },
+  {
+    "check": "untrusted_certificate_rejected",
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "ssh3-client failed: the cryptographic handshake failed: error 48: invalid peer certificate: UnknownIssuer\n"
+  }
+]

@@ -236,13 +236,11 @@ impl Conversation {
     }
 
     pub async fn accept_channel_with_metadata(&self) -> Result<AcceptedChannel, ConversationError> {
-        loop {
-            if let Some(channel) = self.channels_accept_queue.next() {
-                return self.confirm_and_register_channel(channel).await;
-            }
-            let channel = self.channels_accept_queue.wait_next().await;
+        if let Some(channel) = self.channels_accept_queue.next() {
             return self.confirm_and_register_channel(channel).await;
         }
+        let channel = self.channels_accept_queue.wait_next().await;
+        self.confirm_and_register_channel(channel).await
     }
 
     pub async fn add_datagram(&self, datagram: &[u8]) -> Result<(), ConversationError> {

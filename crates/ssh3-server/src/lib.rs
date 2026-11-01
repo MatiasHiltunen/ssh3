@@ -1908,6 +1908,8 @@ fn is_benign_server_error(error: &ServerError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    include!("../../ssh3-auth/tests/support/p256_key.rs");
+
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::PathBuf;
@@ -1918,14 +1920,13 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use futures_util::future::poll_fn;
     use http::header::HeaderValue;
-    use p256::SecretKey as P256SecretKey;
-    use rand_core::OsRng;
     use rsa::RsaPrivateKey as JwtRsaPrivateKey;
     use rsa::pkcs1v15::{Signature as RsaSignature, SigningKey as RsaSigningKey};
+    use rsa::rand_core::OsRng;
+    use rsa::sha2::Sha256;
+    use rsa::signature::{SignatureEncoding, Signer};
     use rsa::traits::PublicKeyParts;
-    use sha2::Sha256;
-    use signature::{SignatureEncoding, Signer};
-    use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, RsaKeypair};
+    use ssh_key::private::{Ed25519Keypair, RsaKeypair};
     use ssh3_auth::{build_bearer_token, conversation_id_base64};
     use ssh3_core::{Channel, Conversation};
     use ssh3_h3::{
@@ -2343,13 +2344,7 @@ mod tests {
             AuthKeyAlgorithm::Ed25519 => {
                 ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[21; 32]))
             }
-            AuthKeyAlgorithm::NistP256 => {
-                let secret_key = P256SecretKey::from_slice(&[23; 32]).unwrap();
-                ssh_key::PrivateKey::from(EcdsaKeypair::NistP256 {
-                    public: secret_key.public_key().into(),
-                    private: secret_key.into(),
-                })
-            }
+            AuthKeyAlgorithm::NistP256 => test_p256_private_key(),
             AuthKeyAlgorithm::Rsa => {
                 let rsa_private_key = JwtRsaPrivateKey::new(&mut OsRng, 2048).unwrap();
                 ssh_key::PrivateKey::from(RsaKeypair::try_from(&rsa_private_key).unwrap())

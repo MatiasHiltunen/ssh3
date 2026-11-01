@@ -498,8 +498,7 @@ async fn read_var_int(recv: &mut RecvStream) -> Result<u64, ChannelSetupError> {
 
 async fn read_ssh_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, ChannelSetupError> {
     let len = read_var_int(recv).await?;
-    let len = usize::try_from(len)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SSH string too large"))?;
+    let len = ssh3_proto::checked_ssh_string_length(len)?;
     let mut out = vec![0; len];
     read_exact(recv, &mut out).await?;
     Ok(out)
@@ -584,6 +583,30 @@ mod tests {
             client_connection,
             server_connection,
         )
+    }
+
+    #[tokio::test]
+    async fn oversized_channel_types_are_rejected_before_allocation() {
+        let (_client_endpoint, _server_endpoint, client, server) = loopback().await;
+        let (mut send, _) = client.open_bi().await.unwrap();
+        let mut header = Vec::new();
+        append_var_int(&mut header, ssh3_proto::SSH_FRAME_TYPE);
+        append_var_int(&mut header, 0);
+        append_var_int(&mut header, ssh3_proto::MAX_VARINT);
+        send.write_all(&header).await.unwrap();
+        send.finish().unwrap();
+        let (_, mut recv) = server.accept_bi().await.unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::read_incoming_channel(&mut recv),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::ChannelSetupError::Proto(ssh3_proto::Error::InvalidLength(_))
+        ));
     }
 
     #[tokio::test]
