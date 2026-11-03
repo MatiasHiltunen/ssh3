@@ -100,6 +100,13 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 	qconf.EnableDatagrams = true
 	qconf.KeepAlivePeriod = 1 * time.Second
 
+	if proxyRemoteAddr != nil {
+		// The inner QUIC packet must fit inside the outer SSH3 datagram, including
+		// QUIC/SSH3 framing. The upstream 1280-byte default is too large initially.
+		qconf.InitialPacketSize = 1200
+		qconf.DisablePathMTUDiscovery = true
+	}
+
 	if certs, ok := knownHosts[options.CanonicalHostFormat()]; ok {
 		foundSelfsignedSSH3 := false
 

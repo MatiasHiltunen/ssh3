@@ -2,7 +2,9 @@
 
 Validated locally on Linux x86_64 using Go 1.27.3, Rust/Cargo 1.99.1, and
 govulncheck 1.9.0. Base: `95671a81207ec2593f11d4c19fefca4066c0a4e7`
-(main, merged PR #1). **Publication is pending user approval: no push or PR.**
+(main, merged PR #1). This records the initial validation before PR #2 was published and merged.
+The [CI regression follow-up](validation/GO_CI_REGRESSIONS.md) records the later
+compatibility fixes and their validation.
 Machine-readable results and dependency changes: [`validation/go-validation.json`](validation/go-validation.json).
 
 ## Changes

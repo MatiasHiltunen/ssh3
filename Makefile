@@ -1,3 +1,5 @@
+.PHONY: lint test integration-tests install build client server
+
 GOOS?=linux
 BUILDFLAGS ?=-ldflags "-X main.version=$(shell git describe --tags --always --dirty) -X main.buildDate=$(shell date +%Y-%m-%d)"
 

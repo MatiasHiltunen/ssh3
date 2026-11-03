@@ -520,6 +520,12 @@ func (c *Client) ForwardUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remo
 			}
 			err = channel.SendDatagram(buf[:n])
 			if err != nil {
+				var tooLarge *quic.DatagramTooLargeError
+				if errors.As(err, &tooLarge) {
+					// UDP is unreliable: drop MTU probes/oversized packets, not the tunnel.
+					log.Debug().Int("bytes", n).Msg("dropping UDP datagram larger than QUIC payload limit")
+					continue
+				}
 				log.Error().Msgf("could not send datagram: %s", err)
 				return
 			}

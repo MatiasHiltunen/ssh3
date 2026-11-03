@@ -86,6 +86,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '${{matrix.go-version}}'
+      - name: Detect runner architecture
+        id: host
+        run: echo "goarch=$(go env GOHOSTARCH)" >> "$GITHUB_OUTPUT"
       - name: Install dependencies
         run: go get ./...
       - name: Build Binaries
@@ -95,7 +98,7 @@ jobs:
           GOOS: ${{matrix.goos}}
           GOARCH: ${{matrix.goarch}}
       - name: Classical unit tests
-        if: ${{ matrix.goarch == 'amd64' }} # only actually run the test suite with the architecture of the host
+        if: ${{ matrix.goarch == steps.host.outputs.goarch }}
         run: make -e test
         env:
           GOOS: ${{matrix.goos}}

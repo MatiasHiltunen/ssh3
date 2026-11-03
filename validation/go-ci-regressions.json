@@ -1,0 +1,41 @@
+{
+  "date": "2026-11-03",
+  "base_commit": "a371e09ca217bf5c1685e24420d7ab5e545d1aa3",
+  "previous_pr": "https://github.com/MatiasHiltunen/ssh3/pull/2",
+  "previous_pr_state": "merged",
+  "local_integration_runs": [
+    {
+      "passed": 18,
+      "failed": 0,
+      "pending": 0,
+      "skipped": 2
+    },
+    {
+      "passed": 18,
+      "failed": 0,
+      "pending": 0,
+      "skipped": 2
+    }
+  ],
+  "legacy_exec_limitation": "Only UID/GID 0 are mapped and CAP_SETGID is unavailable; legacy fork/exec calls setgroups and returns EPERM. Both servers reach authenticated HTTP 200 before exec.",
+  "rust": {
+    "passed": 106,
+    "failed": 0,
+    "filtered_unix_agent_tests": 7
+  },
+  "go": {
+    "race": "passed",
+    "vet": "passed",
+    "disable_password_auth": "passed",
+    "linux_client_and_server_build": "passed",
+    "darwin_amd64_client_and_server_cross_build": "passed",
+    "darwin_arm64_client_and_server_cross_build": "passed",
+    "govulncheck_reachable_advisories": [],
+    "govulncheck_module_only_advisories": [
+      "GO-2026-5932"
+    ]
+  },
+  "ci_status": "full Linux legacy-exec and native macOS runs pending publication",
+  "fixtures": "temporary identity and profile files restored byte-for-byte",
+  "publication_status_at_validation": "local only; awaiting review and approval for follow-up PR"
+}
