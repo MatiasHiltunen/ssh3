@@ -1,0 +1,53 @@
+--- a/http3/client.go
++++ b/http3/client.go
+@@ -509,3 +509,7 @@
+ 		fmt.Sprintf("server opened bidirectional stream %d", str.StreamID()),
+ 	)
+ }
++
++// DisableDatagramHandling gives the application ownership of raw QUIC datagrams.
++// Call before handling any incoming unidirectional streams.
++func (c *RawClientConn) DisableDatagramHandling() { c.rawConn.disableDatagramHandling = true }
+--- a/http3/conn.go
++++ b/http3/conn.go
+@@ -30,7 +30,8 @@
+ 
+ 	logger *slog.Logger
+ 
+-	enableDatagrams bool
++	enableDatagrams         bool
++	disableDatagramHandling bool
+ 
+ 	streamMx sync.Mutex
+ 	streams  map[quic.StreamID]*stateTrackingStream
+@@ -247,12 +248,14 @@
+ 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeSettingsError), "missing QUIC Datagram support")
+ 			return
+ 		}
+-		c.qloggerWG.Go(func() {
+-			err := c.receiveDatagrams()
+-			if c.logger != nil {
+-				c.logger.Debug("receiving datagrams failed", "error", err)
+-			}
+-		})
++		if !c.disableDatagramHandling {
++			c.qloggerWG.Go(func() {
++				err := c.receiveDatagrams()
++				if c.logger != nil {
++					c.logger.Debug("receiving datagrams failed", "error", err)
++				}
++			})
++		}
+ 	}
+ 
+ 	c.controlStrHandler(str, fp)
+--- a/http3/server_conn.go
++++ b/http3/server_conn.go
+@@ -314,3 +314,7 @@
+ func (c *RawServerConn) HandleUnidirectionalStream(str *quic.ReceiveStream) {
+ 	c.rawConn.handleUnidirectionalStream(str, true)
+ }
++
++// DisableDatagramHandling gives the application ownership of raw QUIC datagrams.
++// Call before handling any incoming unidirectional streams.
++func (c *RawServerConn) DisableDatagramHandling() { c.rawConn.disableDatagramHandling = true }

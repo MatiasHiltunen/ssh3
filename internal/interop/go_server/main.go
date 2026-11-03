@@ -70,7 +70,7 @@ func run() int {
 	}
 	server := http3.Server{
 		EnableDatagrams: true,
-		QuicConfig: &quic.Config{
+		QUICConfig: &quic.Config{
 			Allow0RTT: true,
 		},
 		TLSConfig: http3.ConfigureTLSConfig(baseTLSConfig),
@@ -98,28 +98,21 @@ func run() int {
 			return
 		}
 
-		hijacker, ok := w.(http3.Hijacker)
+		qconn, ok := ssh3.QUICConnectionFromRequest(r)
 		if !ok {
-			http.Error(w, "http3 hijacker unavailable", http.StatusInternalServerError)
+			http.Error(w, "HTTP/3 connection unavailable", http.StatusInternalServerError)
 			return
 		}
 
-		streamCreator := hijacker.StreamCreator()
-		qconn := streamCreator.(quic.Connection)
 		if !qconn.ConnectionState().TLS.HandshakeComplete {
 			fmt.Fprintln(os.Stderr, "unauthorized: TLS handshake incomplete")
 			w.WriteHeader(http.StatusTooEarly)
 			return
 		}
 
-		streamer, ok := r.Body.(http3.HTTPStreamer)
-		if !ok {
-			http.Error(w, "http3 stream unavailable", http.StatusInternalServerError)
-			return
-		}
 		conv, err := ssh3.NewServerConversation(
 			context.Background(),
-			streamer.HTTPStream(),
+			nil,
 			qconn,
 			qconn,
 			30_000,
@@ -184,7 +177,7 @@ func run() int {
 	defer packetConn.Close()
 
 	fmt.Printf("READY %s\n", packetConn.LocalAddr().String())
-	if err := server.Serve(packetConn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := ssh3Server.Serve(packetConn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(os.Stderr, "go interop server failed: %s\n", err)
 		return 1
 	}
@@ -349,6 +342,13 @@ func runExec(user *unix_util.User, channel ssh3.Channel, command string) error {
 	stdoutDone := readResult(stdout, ssh3Messages.SSH_EXTENDED_DATA_NONE)
 	stderrDone := readResult(stderr, ssh3Messages.SSH_EXTENDED_DATA_STDERR)
 
+	// Read both pipes to EOF before Wait closes them. Otherwise a short command
+	// can lose output and never send its exit status under load.
+	stdoutErr := <-stdoutDone
+	stderrErr := <-stderrDone
+	if stdoutErr != nil || stderrErr != nil {
+		_ = cmd.Process.Kill()
+	}
 	exitStatus := 1
 	waitErr := cmd.Wait()
 	if waitErr == nil {
@@ -363,11 +363,11 @@ func runExec(user *unix_util.User, channel ssh3.Channel, command string) error {
 		return waitErr
 	}
 
-	if err := <-stdoutDone; err != nil {
-		return err
+	if stdoutErr != nil {
+		return stdoutErr
 	}
-	if err := <-stderrDone; err != nil {
-		return err
+	if stderrErr != nil {
+		return stderrErr
 	}
 
 	return channel.SendRequest(&ssh3Messages.ChannelRequestMessage{

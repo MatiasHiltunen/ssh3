@@ -46,10 +46,7 @@ func NewReader(r io.Reader) Reader {
 
 func (r *byteReader) ReadByte() (byte, error) {
 	var b [1]byte
-	n, err := r.Reader.Read(b[:])
-	if n == 1 && err == io.EOF {
-		err = nil
-	}
+	_, err := io.ReadFull(r.Reader, b[:])
 	return b[0], err
 }
 
@@ -201,20 +198,22 @@ func VarIntLen(i uint64) uint64 {
 	}{"value doesn't fit into 62 bits: ", i})
 }
 
+// MaxSSHStringLength bounds allocations controlled by a peer, matching the Rust decoder.
+const MaxSSHStringLength = 16 * 1024 * 1024
+
 func ParseSSHString(buf Reader) (string, error) {
 	length, err := ReadVarInt(buf)
 	if err != nil {
 		return "", InvalidSSHString{err}
 	}
-	out := make([]byte, length)
-	n, err := io.ReadFull(buf, out)
-	if n != int(length) {
-		return "", InvalidSSHString{fmt.Errorf("expected length %d, read length %d", length, n)}
+	if length > MaxSSHStringLength {
+		return "", InvalidSSHString{fmt.Errorf("SSH string length %d exceeds %d", length, MaxSSHStringLength)}
 	}
-	if err != nil && err != io.EOF {
-		return "", err
+	out := make([]byte, int(length))
+	if _, err := io.ReadFull(buf, out); err != nil {
+		return "", InvalidSSHString{err}
 	}
-	return string(out[:n]), err
+	return string(out), nil
 }
 
 func WriteSSHString(out []byte, s string) (int, error) {

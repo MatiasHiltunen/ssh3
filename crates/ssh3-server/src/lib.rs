@@ -5,7 +5,7 @@ use std::fmt;
 #[cfg(unix)]
 use std::fs::File as StdFile;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -61,6 +61,9 @@ pub struct ServerConfig {
     pub max_packet_size: u64,
     pub default_datagrams_queue_size: usize,
     pub require_authentication: bool,
+    /// Allow unauthenticated non-loopback access for deliberately insecure development.
+    /// This does not disable authentication when an authentication method is configured.
+    pub allow_insecure_unauthenticated_remote: bool,
     pub enable_password_login: bool,
     pub authorized_identity_paths: Vec<PathBuf>,
     pub default_user: Option<String>,
@@ -80,6 +83,10 @@ impl fmt::Debug for ServerConfig {
                 &self.default_datagrams_queue_size,
             )
             .field("require_authentication", &self.require_authentication)
+            .field(
+                "allow_insecure_unauthenticated_remote",
+                &self.allow_insecure_unauthenticated_remote,
+            )
             .field("enable_password_login", &self.enable_password_login)
             .field("authorized_identity_paths", &self.authorized_identity_paths)
             .field("default_user", &self.default_user)
@@ -101,6 +108,7 @@ impl Default for ServerConfig {
             max_packet_size: 30_000,
             default_datagrams_queue_size: 10,
             require_authentication: false,
+            allow_insecure_unauthenticated_remote: false,
             enable_password_login: false,
             authorized_identity_paths: Vec::new(),
             default_user: current_username(),
@@ -847,6 +855,55 @@ fn validate_server_config(config: &ServerConfig) -> Result<(), ServerError> {
         )
         .into());
     }
+    validate_listener_addr(config, config.bind_addr)?;
+    Ok(())
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ipv4| ipv4.is_loopback())
+        }
+    }
+}
+
+fn validate_listener_addr(config: &ServerConfig, addr: SocketAddr) -> Result<(), ServerError> {
+    if !is_loopback_ip(addr.ip())
+        && !should_authenticate(config)
+        && !config.allow_insecure_unauthenticated_remote
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "non-loopback listener {addr} requires authentication; enable --require-auth, \
+                 --authorized-identity, or --enable-password-login, or explicitly opt into \
+                 insecure development with --allow-insecure-unauthenticated-remote"
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_connection_addresses(
+    config: &ServerConfig,
+    local_ip: Option<IpAddr>,
+    remote_addr: SocketAddr,
+) -> Result<(), ServerError> {
+    // A caller can pass an existing connection with a default (loopback) config.
+    // The peer must be local too, including platforms without local-IP metadata.
+    if !should_authenticate(config)
+        && !config.allow_insecure_unauthenticated_remote
+        && (!is_loopback_ip(remote_addr.ip()) || local_ip.is_some_and(|ip| !is_loopback_ip(ip)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "non-loopback connections require authentication; \
+             allow_insecure_unauthenticated_remote is for deliberately insecure development only",
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -860,6 +917,14 @@ pub async fn run_with_self_signed(config: ServerConfig) -> Result<(), ServerErro
 
 pub async fn serve_endpoint(endpoint: Endpoint, config: ServerConfig) -> Result<(), ServerError> {
     validate_server_config(&config)?;
+    let listen_addr = endpoint.local_addr()?;
+    // An externally constructed endpoint need not match config.bind_addr.
+    validate_listener_addr(&config, listen_addr)?;
+    if !is_loopback_ip(listen_addr.ip()) && !should_authenticate(&config) {
+        eprintln!(
+            "WARNING: unauthenticated remote access enabled on {listen_addr}; insecure development only"
+        );
+    }
     while let Some(incoming) = endpoint.accept().await {
         let config = config.clone();
         tokio::spawn(async move {
@@ -887,6 +952,12 @@ pub async fn serve_connection(
     config: ServerConfig,
 ) -> Result<(), ServerError> {
     validate_server_config(&config)?;
+    if let Err(error) =
+        validate_connection_addresses(&config, connection.local_ip(), connection.remote_address())
+    {
+        connection.close(0u32.into(), b"unauthenticated remote access is disabled");
+        return Err(error);
+    }
     let mut driver = ServerConnectionDriver::new(connection.clone()).await?;
     let Some(accepted) = driver
         .accept_conversation(config.max_packet_size, config.default_datagrams_queue_size)
@@ -1948,6 +2019,273 @@ mod tests {
         BASE64_STANDARD, ServerConfig, current_username, effective_shell, lookup_session_user,
         serve_connection,
     };
+
+    #[test]
+    fn unauthenticated_loopback_configurations_remain_valid() {
+        for bind_addr in [
+            "127.0.0.1:0",
+            "127.1.2.3:0",
+            "127.255.255.254:0",
+            "[::1]:0",
+            "[::ffff:127.0.0.1]:0",
+        ] {
+            let config = ServerConfig {
+                bind_addr: bind_addr.parse().unwrap(),
+                ..ServerConfig::default()
+            };
+            assert!(!super::should_authenticate(&config));
+            assert!(!config.allow_insecure_unauthenticated_remote);
+            super::validate_server_config(&config).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_external_listeners_are_rejected_before_binding() {
+        for bind_addr in [
+            "0.0.0.0:0",
+            "192.0.2.1:0",
+            "10.0.0.1:0",
+            "169.254.1.1:0",
+            "[::]:0",
+            "[2001:db8::1]:0",
+            "[fd00::1]:0",
+            "[fe80::1]:0",
+            "[::ffff:0.0.0.0]:0",
+            "[::ffff:192.0.2.1]:0",
+            "[::127.0.0.1]:0",
+        ] {
+            let config = ServerConfig {
+                bind_addr: bind_addr.parse().unwrap(),
+                ..ServerConfig::default()
+            };
+            let error = timeout(Duration::from_secs(5), super::run_with_self_signed(config))
+                .await
+                .expect("invalid configuration must fail before listening")
+                .unwrap_err();
+            assert!(
+                matches!(error, super::ServerError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+                "{bind_addr}: {error}"
+            );
+            assert!(error.to_string().contains("requires authentication"));
+        }
+    }
+
+    #[test]
+    fn remote_configuration_requires_an_enabled_authentication_method() {
+        for bind_addr in ["0.0.0.0:0", "[::]:0"] {
+            let config = ServerConfig {
+                bind_addr: bind_addr.parse().unwrap(),
+                ..ServerConfig::default()
+            };
+            let mut required = config.clone();
+            required.require_authentication = true;
+            super::validate_server_config(&required).unwrap();
+
+            let mut identities = config.clone();
+            identities.authorized_identity_paths = vec![PathBuf::from("authorized_identities")];
+            super::validate_server_config(&identities).unwrap();
+
+            let mut password = config;
+            password.password_verifier = Some(Arc::new(|_, _| Ok(false)));
+            // A verifier alone must not be mistaken for enabled password login.
+            assert!(super::validate_server_config(&password).is_err());
+            password.enable_password_login = true;
+            super::validate_server_config(&password).unwrap();
+        }
+    }
+
+    #[test]
+    fn existing_connections_cannot_hide_external_addresses_with_a_loopback_config() {
+        let config = ServerConfig::default();
+        for (local_ip, remote_addr, allowed) in [
+            (Some("127.0.0.1"), "127.0.0.1:1234", true),
+            (Some("::1"), "[::1]:1234", true),
+            (Some("::ffff:127.0.0.1"), "[::ffff:127.0.0.2]:1234", true),
+            (None, "127.0.0.1:1234", true),
+            (None, "192.0.2.2:1234", false),
+            (Some("127.0.0.1"), "192.0.2.2:1234", false),
+            (Some("192.0.2.1"), "127.0.0.1:1234", false),
+            (Some("2001:db8::1"), "[::1]:1234", false),
+            (Some("::127.0.0.1"), "[::1]:1234", false),
+        ] {
+            let local_ip = local_ip.map(|ip| ip.parse().unwrap());
+            let remote_addr = remote_addr.parse().unwrap();
+            assert_eq!(
+                super::validate_connection_addresses(&config, local_ip, remote_addr).is_ok(),
+                allowed
+            );
+            for (require_authentication, allow_insecure_unauthenticated_remote) in
+                [(true, false), (false, true)]
+            {
+                let explicit = ServerConfig {
+                    require_authentication,
+                    allow_insecure_unauthenticated_remote,
+                    ..config.clone()
+                };
+                super::validate_connection_addresses(&explicit, local_ip, remote_addr).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_wildcard_endpoints_cannot_hide_behind_a_loopback_config() {
+        for bind_addr in ["0.0.0.0:0", "[::]:0"] {
+            let (tls, _) = self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+            let endpoint = quinn::Endpoint::server(tls, bind_addr.parse().unwrap()).unwrap();
+            let error = timeout(
+                Duration::from_secs(5),
+                super::serve_endpoint(endpoint, ServerConfig::default()),
+            )
+            .await
+            .expect("actual wildcard listener must be rejected immediately")
+            .unwrap_err();
+            assert!(
+                matches!(error, super::ServerError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidInput),
+                "{bind_addr}: {error}"
+            );
+        }
+    }
+
+    async fn endpoint_accepts_request(
+        config: ServerConfig,
+        authorization: impl FnOnce(&[u8; 32]) -> Option<String>,
+    ) -> bool {
+        let (tls, certificate) = self_signed_server_config(vec!["localhost".to_string()]).unwrap();
+        let endpoint = quinn::Endpoint::server(tls, config.bind_addr).unwrap();
+        let bound = endpoint.local_addr().unwrap();
+        let loopback: std::net::IpAddr = if bound.is_ipv4() { "127.0.0.1" } else { "::1" }
+            .parse()
+            .unwrap();
+        let server_addr = SocketAddr::new(loopback, bound.port());
+        let server_task = tokio::spawn(super::serve_endpoint(endpoint.clone(), config));
+        let mut client = quinn::Endpoint::client(SocketAddr::new(loopback, 0)).unwrap();
+        client.set_default_client_config(client_config_for_certificate(certificate).unwrap());
+        let connection = timeout(
+            Duration::from_secs(5),
+            client.connect(server_addr, "localhost").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (mut driver, mut requests) = new_client(connection.clone()).await.unwrap();
+        let driver_task = tokio::spawn(async move { poll_fn(|cx| driver.poll_close(cx)).await });
+        let mut request = build_connect_request(
+            "https://localhost/ssh3-term".parse().unwrap(),
+            SSH3_VERSION_STRING,
+        )
+        .unwrap();
+        request.headers_mut().insert(
+            SSH3_USER_HEADER,
+            HeaderValue::from_str(&current_username().unwrap()).unwrap(),
+        );
+        if let Some(authorization) = authorization(&generate_conversation_id(&connection).unwrap())
+        {
+            request.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&authorization).unwrap(),
+            );
+        }
+        let established = timeout(
+            Duration::from_secs(5),
+            establish_client_conversation(&mut requests, connection.clone(), request, 30_000, 10),
+        )
+        .await
+        .expect("server must accept or reject the request promptly");
+        let accepted = established.is_ok();
+        drop(established);
+        connection.close(0u32.into(), b"test complete");
+        endpoint.close(0u32.into(), b"test complete");
+        let _ = timeout(Duration::from_secs(5), driver_task)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), client.wait_idle())
+            .await
+            .unwrap();
+        accepted
+    }
+
+    #[tokio::test]
+    async fn loopback_endpoints_still_accept_unauthenticated_development_requests() {
+        for bind_addr in ["127.0.0.1:0", "[::1]:0"] {
+            let config = ServerConfig {
+                bind_addr: bind_addr.parse().unwrap(),
+                ..ServerConfig::default()
+            };
+            assert!(
+                endpoint_accepts_request(config, |_| None).await,
+                "{bind_addr}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_endpoints_require_and_accept_identity_authentication() {
+        let fixture = create_auth_fixture(AuthKeyAlgorithm::Ed25519);
+        let key = &fixture.private_key;
+        for bind_addr in ["0.0.0.0:0", "[::]:0"] {
+            for require_authentication in [false, true] {
+                let config = ServerConfig {
+                    bind_addr: bind_addr.parse().unwrap(),
+                    require_authentication,
+                    authorized_identity_paths: vec![fixture.authorized_identities_path.clone()],
+                    ..ServerConfig::default()
+                };
+                assert!(
+                    endpoint_accepts_request(config.clone(), |id| Some(format!(
+                        "Bearer {}",
+                        build_bearer_token(key, &fixture.username, id).unwrap()
+                    )))
+                    .await
+                );
+                assert!(!endpoint_accepts_request(config, |_| None).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_endpoints_accept_enabled_password_authentication() {
+        let username = current_username().unwrap();
+        for bind_addr in ["0.0.0.0:0", "[::]:0"] {
+            let config = ServerConfig {
+                bind_addr: bind_addr.parse().unwrap(),
+                enable_password_login: true,
+                password_verifier: Some(Arc::new({
+                    let username = username.clone();
+                    move |user, password| Ok(user == username && password == "test-only-password")
+                })),
+                ..ServerConfig::default()
+            };
+            let authorization = format!(
+                "Basic {}",
+                BASE64_STANDARD.encode(format!("{username}:test-only-password"))
+            );
+            assert!(endpoint_accepts_request(config.clone(), |_| Some(authorization)).await);
+            assert!(!endpoint_accepts_request(config, |_| None).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn insecure_remote_access_requires_explicit_override_and_keeps_authentication_enabled() {
+        for bind_addr in ["0.0.0.0:0", "[::]:0"] {
+            let config = ServerConfig {
+                bind_addr: bind_addr.parse().unwrap(),
+                allow_insecure_unauthenticated_remote: true,
+                ..ServerConfig::default()
+            };
+            assert!(endpoint_accepts_request(config.clone(), |_| None).await);
+            let authenticated = ServerConfig {
+                require_authentication: true,
+                ..config
+            };
+            assert!(!endpoint_accepts_request(authenticated, |_| None).await);
+        }
+    }
 
     struct TestHarness {
         client_endpoint: quinn::Endpoint,

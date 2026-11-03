@@ -328,7 +328,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						defer session.Terminate()
 
 						// Try to connect to the local forwarded port
-						localAddr := fmt.Sprintf("%s:%d", localIP, localPort)
+						localAddr := net.JoinHostPort(localIP, fmt.Sprint(localPort))
 						var conn net.Conn
 						// connection refused might happen betwen the time when the process starts and actually listens the socket
 						Eventually(func() error {
@@ -448,7 +448,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 
 					// if the remote addr is IPv4 (resp. IPv6), ssh3 listens on the IPv4 (resp. IPv6) loopback
 					// Try to connect to the local forwarded port
-					localAddr := fmt.Sprintf("%s:%d", localIP, localPort)
+					localAddr := net.JoinHostPort(localIP, fmt.Sprint(localPort))
 
 					var conn net.Conn
 					Eventually(func() error {

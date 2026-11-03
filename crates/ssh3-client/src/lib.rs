@@ -1073,6 +1073,31 @@ pub async fn run_session_stdio(
     result
 }
 
+// Once CONNECT succeeds, SSH3 owns incoming bidirectional streams. Keep the
+// HTTP/3 driver (and its critical send streams) alive without its standard HTTP/3
+// loop rejecting SSH3's server-initiated channel streams.
+fn spawn_bootstrap_driver(
+    mut driver: ssh3_h3::ClientConnection,
+    connection: Connection,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (pause_tx, pause_rx) = tokio::sync::oneshot::channel();
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            _ = poll_fn(|cx| driver.poll_close(cx)) => return,
+            _ = pause_rx => {}
+        }
+        let _ = paused_tx.send(());
+        connection.closed().await;
+        drop(driver);
+    });
+    (task, pause_tx, paused_rx)
+}
+
 async fn connect_client(config: &ClientConfig) -> Result<ActiveClient, ClientError> {
     connect_client_with_browser_opener(config, default_browser_opener).await
 }
@@ -1085,10 +1110,9 @@ async fn connect_client_with_browser_opener(
 
     let (endpoint, connection) = connect_target(config).await?;
 
-    let (mut driver, mut send_request) = new_client(connection.clone()).await?;
-    let driver_task = tokio::spawn(async move {
-        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
-    });
+    let (driver, mut send_request) = new_client(connection.clone()).await?;
+    let (driver_task, pause_driver, driver_paused) =
+        spawn_bootstrap_driver(driver, connection.clone());
 
     let conversation_id = generate_conversation_id(&connection)?;
     let mut request =
@@ -1150,7 +1174,8 @@ async fn connect_client_with_browser_opener(
         config.default_datagrams_queue_size,
     )
     .await?;
-    driver_task.abort();
+    let _ = pause_driver.send(());
+    let _ = driver_paused.await;
     Ok(activate_client(
         endpoint,
         connection,
@@ -1551,7 +1576,6 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::fs::File as StdFile;
-    use std::future::poll_fn;
     use std::io;
     #[cfg(unix)]
     use std::io::{Read, Write};
@@ -1691,10 +1715,9 @@ mod tests {
     ) -> Result<super::ActiveClient, ClientError> {
         let (endpoint, connection) = connect_target(config).await?;
 
-        let (mut driver, mut send_request) = new_client(connection.clone()).await?;
-        let driver_task = tokio::spawn(async move {
-            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
-        });
+        let (driver, mut send_request) = new_client(connection.clone()).await?;
+        let (driver_task, pause_driver, driver_paused) =
+            super::spawn_bootstrap_driver(driver, connection.clone());
 
         let conversation_id = generate_conversation_id(&connection)?;
         let mut request = build_connect_request(config.target_url.clone(), &config.user_agent)?;
@@ -1716,7 +1739,8 @@ mod tests {
             config.default_datagrams_queue_size,
         )
         .await?;
-        driver_task.abort();
+        let _ = pause_driver.send(());
+        let _ = driver_paused.await;
 
         Ok(activate_client(
             endpoint,
@@ -1990,6 +2014,94 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct TestAuthorizedIdentities {
+        path: PathBuf,
+        original: Option<Vec<u8>>,
+        created_dir: bool,
+    }
+
+    #[cfg(unix)]
+    impl TestAuthorizedIdentities {
+        fn install(username: &str, fixture_home: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let user = User::from_name(username).unwrap().unwrap();
+            let dir = user.dir.join(".ssh3");
+            let created_dir = !dir.exists();
+            fs::create_dir_all(&dir).unwrap();
+            if created_dir {
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let path = dir.join("authorized_identities");
+            assert!(
+                !path.is_symlink(),
+                "test identities path must not be a symlink"
+            );
+            let original = match fs::read(&path) {
+                Ok(data) => Some(data),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot read test identities backup: {error}"),
+            };
+            let guard = Self {
+                path,
+                original,
+                created_dir,
+            };
+            let mut identities = guard.original.clone().unwrap_or_default();
+            identities.push(b'\n');
+            for relative in [".ssh/authorized_keys", ".ssh3/authorized_identities"] {
+                match fs::read(fixture_home.join(relative)) {
+                    Ok(data) => {
+                        identities.extend_from_slice(&data);
+                        identities.push(b'\n');
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("cannot read fixture identities: {error}"),
+                }
+            }
+            fs::write(&guard.path, identities).unwrap();
+            if guard.original.is_none() {
+                fs::set_permissions(&guard.path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            guard
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestAuthorizedIdentities {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                fs::write(&self.path, original).unwrap();
+            } else {
+                let _ = fs::remove_file(&self.path);
+            }
+            if self.created_dir {
+                let _ = fs::remove_dir(self.path.parent().unwrap());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct GoTestServer {
+        child: tokio::process::Child,
+        _identities: TestAuthorizedIdentities,
+    }
+
+    #[cfg(unix)]
+    impl std::ops::Deref for GoTestServer {
+        type Target = tokio::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.child
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::ops::DerefMut for GoTestServer {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.child
+        }
+    }
+
+    #[cfg(unix)]
     async fn spawn_go_cli_server(
         bind_addr: &str,
         username: &str,
@@ -1997,8 +2109,10 @@ mod tests {
         cert_path: &Path,
         key_path: &Path,
         log_path: &Path,
-    ) -> tokio::process::Child {
+    ) -> GoTestServer {
         let binaries = go_cli_binaries();
+        // The real Unix server uses the account database, not the process HOME.
+        let identities = TestAuthorizedIdentities::install(username, home_dir);
         fs::create_dir_all(home_dir).unwrap();
         let stderr_log = fs::File::create(log_path).unwrap();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -2044,7 +2158,10 @@ mod tests {
         .await
         .unwrap();
 
-        child
+        GoTestServer {
+            child,
+            _identities: identities,
+        }
     }
 
     #[cfg(unix)]

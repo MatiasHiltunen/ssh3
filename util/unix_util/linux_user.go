@@ -19,6 +19,7 @@ int get_errno() { return errno; }
 import "C"
 import (
 	"fmt"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -44,9 +45,12 @@ func Getspnam(name string) (*ShadowEntry, error) {
 	buf := (*C.char)(C.malloc(1024))
 	defer C.free(unsafe.Pointer(buf))
 
-	_, err := C.getspnam_r(cname, cspwd, buf, 1024, &cspwd)
+	ret, err := C.getspnam_r(cname, cspwd, buf, 1024, &cspwd)
+	if ret != 0 {
+		return nil, syscall.Errno(ret)
+	}
 
-	if unsafe.Pointer(cspwd) == unsafe.Pointer(uintptr(0)) {
+	if cspwd == nil {
 		if err == nil {
 			err = util.UserNotFound{Username: name}
 		}
@@ -68,7 +72,12 @@ func Getspnam(name string) (*ShadowEntry, error) {
  * can also be a fully hashed password, crypt() will only
  * look at the three first components.
  */
+var cryptMutex sync.Mutex
+
 func Crypt(clearPassword, setting string) (string, error) {
+	// crypt returns a shared C buffer; hold the lock until Go owns its copy.
+	cryptMutex.Lock()
+	defer cryptMutex.Unlock()
 	cPassword := C.CString(clearPassword)
 	defer C.free(unsafe.Pointer(cPassword))
 
@@ -78,6 +87,9 @@ func Crypt(clearPassword, setting string) (string, error) {
 	ccrypt_ret := C.crypt(cPassword, cSetting)
 
 	hashedPassword := C.GoString(ccrypt_ret)
+	if len(hashedPassword) == 0 {
+		return "", fmt.Errorf("password hashing failed")
+	}
 	if hashedPassword[0] == '*' {
 		return "", fmt.Errorf("bad password hashing")
 	}
@@ -149,7 +161,7 @@ func getpwnam(name string) (*User, error) {
 		return nil, syscall.Errno(ret)
 	}
 
-	if unsafe.Pointer(cpasswd) == unsafe.Pointer(uintptr(0)) {
+	if cpasswd == nil {
 		if err == nil {
 			err = util.UserNotFound{Username: name}
 		}

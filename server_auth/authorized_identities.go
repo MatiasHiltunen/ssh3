@@ -140,7 +140,7 @@ func ParseAuthorizedIdentitiesFile(user *unix_util.User, file *os.File) (identit
 			log.Error().Msgf("cannot parse identity line: %s: %s", err.Error(), line)
 		}
 	}
-	return identities, nil
+	return identities, scanner.Err()
 }
 
 func GetAuthorizedIdentities(user *unix_util.User) ([]IdentityVerifier, error) {
@@ -150,6 +150,10 @@ func GetAuthorizedIdentities(user *unix_util.User) ([]IdentityVerifier, error) {
 		identitiesFile, err := os.Open(filename)
 		if err == nil {
 			newIdentities, err := ParseAuthorizedIdentitiesFile(user, identitiesFile)
+			closeErr := identitiesFile.Close()
+			if err == nil {
+				err = closeErr
+			}
 			if err != nil {
 				// TODO: logging
 				log.Error().Msgf("error when parsing authorized identities: %s", err)
