@@ -148,3 +148,22 @@ not a complete protocol or application security audit. The server's development
 defaults bind to loopback and do not require authentication: use `--require-auth`
 with authorized identities before exposing a listener, and configure trusted
 certificates rather than using the client's `--insecure` option.
+
+## 2026-11-03: authenticated listener configuration
+
+Non-loopback listeners now require authentication unless the explicit development
+override `--allow-insecure-unauthenticated-remote` is selected. The library also
+checks existing endpoints and direct connection handlers. The later validation
+run passed 90 supported Rust tests and 12 process-level CLI checks; see
+[`validation/AUTHENTICATED_BIND.md`](validation/AUTHENTICATED_BIND.md).
+
+
+## Go update and combined validation
+
+The follow-up Go toolchain/dependency upgrade passes 106 available Rust tests,
+including 16 real Go interoperability tests, with seven Unix-socket tests filtered
+because AF_UNIX creation is denied. Rust HTTP/3 control streams are now retained
+after CONNECT for compatibility with the updated Go transport. The Rust `h3` patch
+was moved unchanged from `vendor/h3` to `third_party/h3` so Go uses normal module
+resolution. See [`GO_VALIDATION.md`](GO_VALIDATION.md) for the combined results,
+Go security fixes, remaining advisories, and publication approval status.

@@ -120,7 +120,7 @@ func run() int {
 	}
 	defer qconn.CloseWithError(0, "done")
 
-	roundTripper := &http3.RoundTripper{
+	roundTripper := &http3.Transport{
 		EnableDatagrams: true,
 	}
 	defer roundTripper.Close()

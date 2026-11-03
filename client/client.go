@@ -3,7 +3,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -290,12 +289,12 @@ func forwardTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net
 }
 
 type Client struct {
-	qconn quic.EarlyConnection
+	qconn *quic.Conn
 	*ssh3.Conversation
 }
 
-func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyConnection,
-	roundTripper *http3.RoundTripper,
+func Dial(ctx context.Context, config *client_config.Config, qconn *quic.Conn,
+	roundTripper *http3.Transport,
 	sshAgent agent.ExtendedAgent) (*Client, error) {
 
 	hostUrl := url.URL{}
@@ -326,16 +325,13 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 		}
 	}
 
-	// dirty hack: ensure only one QUIC connection is used
-	roundTripper.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
-		return qconn, nil
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-qconn.Context().Done():
+		return nil, context.Cause(qconn.Context())
+	case <-qconn.HandshakeComplete():
 	}
-
-	// Do 0RTT GET requests here if needed
-	// Currently, we don't need it but we could use it to retrieve
-	// config or version info from the server
-	// We could also allow user-defined safe/idempotent commands to run with 0-RTT
-	qconn.HandshakeComplete()
 	log.Debug().Msgf("QUIC handshake complete")
 	// Now, we're 1-RTT, we can get the TLS exporter and create the conversation
 	tls := qconn.ConnectionState().TLS
@@ -345,7 +341,7 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 	}
 
 	// the connection struct is created, now build the request used to establish the connection
-	req, err := http.NewRequest("CONNECT", requestUrl, nil)
+	req, err := http.NewRequestWithContext(ctx, "CONNECT", requestUrl, nil)
 	if err != nil {
 		log.Fatal().Msgf("%s", err)
 	}
@@ -467,7 +463,7 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 	}
 
 	log.Debug().Msgf("establish conversation with the server")
-	err = conv.EstablishClientConversation(req, roundTripper, ssh3.AVAILABLE_CLIENT_VERSIONS)
+	err = conv.EstablishClientConversation(req, roundTripper, qconn, ssh3.AVAILABLE_CLIENT_VERSIONS)
 	if errors.Is(err, util.Unauthorized{}) {
 		log.Error().Msgf("Access denied from the server: unauthorized")
 		return nil, err

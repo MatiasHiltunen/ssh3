@@ -1,0 +1,87 @@
+{
+  "validated_on": "2026-11-03",
+  "platform": "Linux x86_64",
+  "checks": [
+    {
+      "check": "reject_unauthenticated_external_bind",
+      "bind": "0.0.0.0:0",
+      "exit_code": 1,
+      "diagnostic": "ssh3-server failed: non-loopback listener 0.0.0.0:0 requires authentication; enable --require-auth, --authorized-identity, or --enable-password-login, or explicitly opt into insecure development with --allow-insecure-unauthenticated-remote"
+    },
+    {
+      "check": "reject_unauthenticated_external_bind",
+      "bind": "[::]:0",
+      "exit_code": 1,
+      "diagnostic": "ssh3-server failed: non-loopback listener [::]:0 requires authentication; enable --require-auth, --authorized-identity, or --enable-password-login, or explicitly opt into insecure development with --allow-insecure-unauthenticated-remote"
+    },
+    {
+      "check": "reject_unauthenticated_external_bind",
+      "bind": "192.0.2.1:0",
+      "exit_code": 1,
+      "diagnostic": "ssh3-server failed: non-loopback listener 192.0.2.1:0 requires authentication; enable --require-auth, --authorized-identity, or --enable-password-login, or explicitly opt into insecure development with --allow-insecure-unauthenticated-remote"
+    },
+    {
+      "check": "reject_unauthenticated_external_bind",
+      "bind": "[2001:db8::1]:0",
+      "exit_code": 1,
+      "diagnostic": "ssh3-server failed: non-loopback listener [2001:db8::1]:0 requires authentication; enable --require-auth, --authorized-identity, or --enable-password-login, or explicitly opt into insecure development with --allow-insecure-unauthenticated-remote"
+    },
+    {
+      "check": "unauthenticated_loopback_command",
+      "bind": "127.0.0.1",
+      "require_auth": false,
+      "exit_code": 0,
+      "stdout": "bind-guard-ok\n"
+    },
+    {
+      "check": "unauthenticated_loopback_command",
+      "bind": "::1",
+      "require_auth": false,
+      "exit_code": 0,
+      "stdout": "bind-guard-ok\n"
+    },
+    {
+      "check": "authenticated_external_command",
+      "bind": "0.0.0.0",
+      "require_auth": true,
+      "exit_code": 0,
+      "stdout": "bind-guard-ok\n"
+    },
+    {
+      "check": "reject_missing_authentication",
+      "bind": "0.0.0.0",
+      "require_auth": true,
+      "exit_code": 1,
+      "diagnostic": "ssh3-client failed: Connection error: Remote error: ApplicationClose: H3_NO_ERROR"
+    },
+    {
+      "check": "authenticated_external_command",
+      "bind": "::",
+      "require_auth": true,
+      "exit_code": 0,
+      "stdout": "bind-guard-ok\n"
+    },
+    {
+      "check": "reject_missing_authentication",
+      "bind": "::",
+      "require_auth": true,
+      "exit_code": 1,
+      "diagnostic": "ssh3-client failed: Connection error: Remote error: ApplicationClose: H3_NO_ERROR"
+    },
+    {
+      "check": "authenticated_external_command",
+      "bind": "0.0.0.0",
+      "require_auth": false,
+      "exit_code": 0,
+      "stdout": "bind-guard-ok\n"
+    },
+    {
+      "check": "reject_missing_authentication",
+      "bind": "0.0.0.0",
+      "require_auth": false,
+      "exit_code": 1,
+      "diagnostic": "ssh3-client failed: Connection error: Remote error: ApplicationClose: H3_NO_ERROR"
+    }
+  ],
+  "passed": 12
+}

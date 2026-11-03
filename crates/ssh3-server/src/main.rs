@@ -24,6 +24,12 @@ struct Cli {
     #[arg(long)]
     require_auth: bool,
 
+    #[arg(
+        long,
+        help = "Allow unauthenticated non-loopback access. UNSAFE: development use only."
+    )]
+    allow_insecure_unauthenticated_remote: bool,
+
     #[arg(long)]
     enable_password_login: bool,
 
@@ -44,6 +50,10 @@ struct Cli {
 
 fn parse_args() -> Result<ServerConfig, clap::Error> {
     let cli = Cli::try_parse()?;
+    Ok(config_from_cli(cli))
+}
+
+fn config_from_cli(cli: Cli) -> ServerConfig {
     let mut config = ServerConfig::default();
     if let Some(bind_addr) = cli.bind {
         config.bind_addr = bind_addr;
@@ -55,6 +65,7 @@ fn parse_args() -> Result<ServerConfig, clap::Error> {
         config.server_header = server_header;
     }
     config.require_authentication = cli.require_auth;
+    config.allow_insecure_unauthenticated_remote = cli.allow_insecure_unauthenticated_remote;
     config.enable_password_login = cli.enable_password_login;
     if !cli.authorized_identity.is_empty() {
         config.authorized_identity_paths = cli.authorized_identity;
@@ -65,7 +76,7 @@ fn parse_args() -> Result<ServerConfig, clap::Error> {
     if let Some(shell) = cli.shell {
         config.shell = Some(shell);
     }
-    Ok(config)
+    config
 }
 
 #[tokio::main]
@@ -88,5 +99,55 @@ async fn main() -> ExitCode {
             eprintln!("ssh3-server failed: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn default_and_external_bind_do_not_implicitly_enable_the_insecure_override() {
+        let defaults = config_from_cli(Cli::try_parse_from(["ssh3-server"]).unwrap());
+        assert!(defaults.bind_addr.ip().is_loopback());
+        assert!(!defaults.allow_insecure_unauthenticated_remote);
+        for address in ["0.0.0.0:4433", "[::]:4433"] {
+            let config =
+                config_from_cli(Cli::try_parse_from(["ssh3-server", "--bind", address]).unwrap());
+            assert!(!config.allow_insecure_unauthenticated_remote);
+            assert!(!config.require_authentication);
+        }
+    }
+
+    #[test]
+    fn insecure_override_is_explicit_and_preserves_authentication_options() {
+        let config = config_from_cli(
+            Cli::try_parse_from([
+                "ssh3-server",
+                "--bind",
+                "[::]:4433",
+                "--allow-insecure-unauthenticated-remote",
+                "--require-auth",
+                "--authorized-identity",
+                "authorized_keys",
+                "--enable-password-login",
+            ])
+            .unwrap(),
+        );
+        assert!(config.allow_insecure_unauthenticated_remote);
+        assert!(config.require_authentication);
+        assert!(config.enable_password_login);
+        assert_eq!(
+            config.authorized_identity_paths,
+            vec![PathBuf::from("authorized_keys")]
+        );
+    }
+
+    #[test]
+    fn insecure_override_help_explains_the_development_risk() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--allow-insecure-unauthenticated-remote"));
+        assert!(help.contains("UNSAFE: development use only"));
     }
 }

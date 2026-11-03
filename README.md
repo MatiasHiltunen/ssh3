@@ -73,7 +73,7 @@ Usage: ssh3-server [OPTIONS]
 For the Rust client, prefer file-backed secret flags such as `--password-file`, `--bearer-token-file`, and `--oidc-client-secret-file` over passing secrets directly on the command line. File-backed secrets are less likely to leak through shell history, process listings, and CI logs.
 
 ### Go
-Use Go 1.21 or newer.
+Use Go 1.27.3 or newer (the current security-patched toolchain).
 
 ```bash
 go build -o ssh3 ./cmd/ssh3
@@ -99,6 +99,20 @@ cargo run -p ssh3-server -- \
   --require-auth \
   --authorized-identity ~/.ssh/authorized_keys
 ```
+
+Unauthenticated development servers are limited to loopback addresses (`127.0.0.0/8`,
+`::1`, and IPv4-mapped loopback). Binding to other IPv4/IPv6 addresses, including
+wildcards such as `0.0.0.0` and `::`, requires authentication. `--require-auth`
+enforces the existing per-user identity lookup; `--authorized-identity` and
+`--enable-password-login` also enable authentication automatically. Password login
+must be supported on the host or use a programmatic verifier.
+
+For deliberately insecure development only, `--allow-insecure-unauthenticated-remote`
+explicitly permits an unauthenticated external listener and emits a warning.
+Library users have the corresponding `ServerConfig::allow_insecure_unauthenticated_remote`
+option, which defaults to `false`. Existing endpoints and direct connection handlers
+enforce the same restriction. The override does not disable configured authentication
+or change TLS trust checks.
 
 Connect with a private key:
 
@@ -233,16 +247,19 @@ That interop suite exercises real Rust and Go binaries against each other, inclu
 - SSH agent auth and agent forwarding
 - TCP and UDP forwarding
 
-If you run direct `go test` commands in this fork, you may need to refresh vendored dependency metadata first:
+Download dependencies and run the Go checks:
 
 ```bash
-go mod vendor
+go mod download
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
 ## Known Gaps
 - The Rust server is intentionally minimal today: self-signed certificates only, no secret URL path, and no public certificate automation.
 - The Rust CLI does not yet expose TCP forwarding, UDP forwarding, or proxy jump flags even though the underlying runtime is implemented and tested.
-- The vendored `h3` patch is a deliberate compatibility shim for arbitrary `:protocol=ssh3` handling and still needs cleanup.
+- The Rust `h3` patch in `third_party/h3` handles arbitrary `:protocol=ssh3` values. The Go `quic-go` patch in `third_party/quic-go` preserves SSH3 datagram framing; see its provenance notes and [`GO_VALIDATION.md`](GO_VALIDATION.md).
 
 ## Security
 SSH3 is promising, but this project still needs substantial review before it should be trusted in production. The protocol surface combines TLS 1.3, QUIC, HTTP authorization, and SSH-style channel semantics, so the right standard is a long period of review and interoperability hardening, not “it seems to work on my machine”.

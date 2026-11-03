@@ -716,6 +716,12 @@ func listenAndAcceptAuthSockets(cancel context.CancelCauseFunc, conversation *ss
 
 func openAgentSocketAndForwardAgent(parent context.Context, conv *ssh3.Conversation, user *unix_util.User) (string, error) {
 	ctx, cancel := context.WithCancelCause(parent)
+	success := false
+	defer func() {
+		if !success {
+			cancel(nil)
+		}
+	}()
 	sockPath, err := unix_util.NewUnixSocketPath()
 	if err != nil {
 		return "", err
@@ -728,6 +734,12 @@ func openAgentSocketAndForwardAgent(parent context.Context, conv *ssh3.Conversat
 		return "", err
 	}
 
+	defer func() {
+		if !success {
+			agentSock.Close()
+			os.RemoveAll(path.Dir(sockPath))
+		}
+	}()
 	sockDir := path.Dir(sockPath)
 	err = os.Chown(sockDir, int(user.Uid), int(user.Gid))
 	if err != nil {
@@ -740,6 +752,7 @@ func openAgentSocketAndForwardAgent(parent context.Context, conv *ssh3.Conversat
 		return "", err
 	}
 
+	success = true
 	go listenAndAcceptAuthSockets(cancel, conv, agentSock, 30000)
 	return sockPath, nil
 }
@@ -914,7 +927,7 @@ func ServerMain() int {
 	server := http3.Server{
 		Handler:         nil,
 		Addr:            *bindAddr,
-		QuicConfig:      quicConf,
+		QUICConfig:      quicConf,
 		EnableDatagrams: true,
 		TLSConfig:       tlsConfig,
 	}
@@ -1024,7 +1037,7 @@ func ServerMain() int {
 	outputMessage := fmt.Sprintf("Server started, listening on %s%s", *bindAddr, *urlPath)
 	fmt.Fprintln(os.Stderr, outputMessage)
 	log.Info().Msg(outputMessage)
-	err = server.ListenAndServe()
+	err = ssh3Server.ListenAndServe()
 
 	if err != nil {
 		log.Error().Msgf("error while serving HTTP connection: %s", err)

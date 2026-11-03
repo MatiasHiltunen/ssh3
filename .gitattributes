@@ -1,0 +1,6 @@
+third_party/h3/** linguist-vendored=true
+third_party/quic-go/** linguist-vendored=true
+# Preserve the upstream RFC grammar comment byte-for-byte.
+third_party/quic-go/http3/transport.go whitespace=-space-before-tab
+# Unified-diff context intentionally contains leading spaces and tabs.
+third_party/quic-go/ssh3.patch -whitespace

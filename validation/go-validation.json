@@ -1,0 +1,358 @@
+{
+  "validated_at_utc": "2026-11-03T00:00:24.575461+00:00",
+  "base_commit": "95671a81207ec2593f11d4c19fefca4066c0a4e7",
+  "publication": "pending user approval; no push or PR",
+  "toolchains": {
+    "go": "1.27.3",
+    "rust": "1.99.1",
+    "govulncheck": "1.9.0"
+  },
+  "rust": {
+    "passed": 106,
+    "failed": 0,
+    "filtered_unix_socket_tests": 7,
+    "go_interop_tests_passed": 16,
+    "check_all_features": "passed",
+    "clippy": "passed with existing warnings",
+    "format": "passed"
+  },
+  "go": {
+    "standard_tests": "passed",
+    "race_tests": "passed",
+    "vet": "passed",
+    "disable_password_auth_tests": "passed",
+    "new_test_functions": 15,
+    "new_fuzz_targets": 1,
+    "fuzz_inputs": 235539,
+    "fuzz_seconds": 10,
+    "fuzz_failures": 0,
+    "module_checksum_verification": "passed",
+    "builds": [
+      "linux/amd64 client",
+      "linux/amd64 server with cgo password support",
+      "linux/amd64 server without cgo/password support",
+      "darwin/arm64 client",
+      "linux/386 server",
+      "freebsd/amd64 server"
+    ],
+    "legacy_integration_specs_passed": 1,
+    "legacy_integration_specs_skipped_missing_fixtures": 17
+  },
+  "go_dependency_changes": [
+    {
+      "module": "github.com/Masterminds/semver/v3",
+      "before": null,
+      "after": "v3.4.0"
+    },
+    {
+      "module": "github.com/caddyserver/certmagic",
+      "before": "v0.20.0",
+      "after": "v0.25.6"
+    },
+    {
+      "module": "github.com/caddyserver/zerossl",
+      "before": null,
+      "after": "v0.1.6"
+    },
+    {
+      "module": "github.com/coreos/go-oidc/v3",
+      "before": "v3.7.0",
+      "after": "v3.21.0"
+    },
+    {
+      "module": "github.com/creack/pty",
+      "before": "v1.1.18",
+      "after": "v1.1.24"
+    },
+    {
+      "module": "github.com/go-jose/go-jose/v4",
+      "before": null,
+      "after": "v4.1.8"
+    },
+    {
+      "module": "github.com/go-logr/logr",
+      "before": "v1.2.4",
+      "after": "v1.4.3"
+    },
+    {
+      "module": "github.com/go-task/slim-sprig/v3",
+      "before": null,
+      "after": "v3.0.0"
+    },
+    {
+      "module": "github.com/golang-jwt/jwt/v5",
+      "before": "v5.0.0",
+      "after": "v5.3.1"
+    },
+    {
+      "module": "github.com/google/go-cmp",
+      "before": "v0.6.0",
+      "after": "v0.7.0"
+    },
+    {
+      "module": "github.com/google/pprof",
+      "before": "v0.0.0-20210407192527-94a9f03dee38",
+      "after": "v0.0.0-20261102214848-0031fcd306b0"
+    },
+    {
+      "module": "github.com/kevinburke/ssh_config",
+      "before": "v1.2.0",
+      "after": "v1.6.0"
+    },
+    {
+      "module": "github.com/klauspost/cpuid/v2",
+      "before": "v2.2.5",
+      "after": "v2.4.1"
+    },
+    {
+      "module": "github.com/libdns/libdns",
+      "before": "v0.2.1",
+      "after": "v1.1.1"
+    },
+    {
+      "module": "github.com/mattn/go-colorable",
+      "before": "v0.1.13",
+      "after": "v0.1.16"
+    },
+    {
+      "module": "github.com/mattn/go-isatty",
+      "before": "v0.0.19",
+      "after": "v0.0.24"
+    },
+    {
+      "module": "github.com/mholt/acmez/v3",
+      "before": null,
+      "after": "v3.1.7"
+    },
+    {
+      "module": "github.com/miekg/dns",
+      "before": "v1.1.55",
+      "after": "v1.1.73"
+    },
+    {
+      "module": "github.com/onsi/ginkgo/v2",
+      "before": "v2.13.0",
+      "after": "v2.34.0"
+    },
+    {
+      "module": "github.com/onsi/gomega",
+      "before": "v1.29.0",
+      "after": "v1.40.0"
+    },
+    {
+      "module": "github.com/quic-go/qpack",
+      "before": "v0.4.0",
+      "after": "v0.6.0"
+    },
+    {
+      "module": "github.com/quic-go/quic-go",
+      "before": "v0.40.1-0.20240102075208-1083d1fb8f98",
+      "after": "v0.64.1"
+    },
+    {
+      "module": "github.com/rs/zerolog",
+      "before": "v1.31.0",
+      "after": "v1.35.1"
+    },
+    {
+      "module": "github.com/zeebo/blake3",
+      "before": "v0.2.3",
+      "after": "v0.2.4"
+    },
+    {
+      "module": "go.uber.org/zap",
+      "before": "v1.24.0",
+      "after": "v1.28.0"
+    },
+    {
+      "module": "go.uber.org/zap/exp",
+      "before": null,
+      "after": "v0.3.0"
+    },
+    {
+      "module": "go.yaml.in/yaml/v3",
+      "before": null,
+      "after": "v3.0.5"
+    },
+    {
+      "module": "golang.org/x/crypto",
+      "before": "v0.17.0",
+      "after": "v0.58.0"
+    },
+    {
+      "module": "golang.org/x/mod",
+      "before": "v0.12.0",
+      "after": "v0.42.0"
+    },
+    {
+      "module": "golang.org/x/net",
+      "before": "v0.17.0",
+      "after": "v0.62.0"
+    },
+    {
+      "module": "golang.org/x/oauth2",
+      "before": "v0.13.0",
+      "after": "v0.37.0"
+    },
+    {
+      "module": "golang.org/x/sync",
+      "before": null,
+      "after": "v0.24.0"
+    },
+    {
+      "module": "golang.org/x/sys",
+      "before": "v0.15.0",
+      "after": "v0.49.0"
+    },
+    {
+      "module": "golang.org/x/term",
+      "before": "v0.15.0",
+      "after": "v0.47.0"
+    },
+    {
+      "module": "golang.org/x/text",
+      "before": "v0.14.0",
+      "after": "v0.43.0"
+    },
+    {
+      "module": "golang.org/x/tools",
+      "before": "v0.12.0",
+      "after": "v0.52.0"
+    },
+    {
+      "module": "google.golang.org/protobuf",
+      "before": "v1.31.0",
+      "after": "v1.36.12"
+    }
+  ],
+  "removed_direct_dependency": "golang.org/x/exp (standard library slices replaces x/exp/slices)",
+  "govulncheck": {
+    "baseline": {
+      "module_advisories": [
+        "GO-2024-2459",
+        "GO-2024-2631",
+        "GO-2024-2682",
+        "GO-2024-2687",
+        "GO-2024-3302",
+        "GO-2024-3321",
+        "GO-2024-3333",
+        "GO-2025-3485",
+        "GO-2025-3487",
+        "GO-2025-3488",
+        "GO-2025-3503",
+        "GO-2025-3553",
+        "GO-2025-3595",
+        "GO-2025-4017",
+        "GO-2025-4116",
+        "GO-2025-4134",
+        "GO-2025-4135",
+        "GO-2025-4233",
+        "GO-2026-4440",
+        "GO-2026-4441",
+        "GO-2026-4918",
+        "GO-2026-4945",
+        "GO-2026-5005",
+        "GO-2026-5006",
+        "GO-2026-5013",
+        "GO-2026-5014",
+        "GO-2026-5015",
+        "GO-2026-5016",
+        "GO-2026-5017",
+        "GO-2026-5018",
+        "GO-2026-5019",
+        "GO-2026-5020",
+        "GO-2026-5021",
+        "GO-2026-5023",
+        "GO-2026-5024",
+        "GO-2026-5025",
+        "GO-2026-5026",
+        "GO-2026-5027",
+        "GO-2026-5028",
+        "GO-2026-5029",
+        "GO-2026-5030",
+        "GO-2026-5033",
+        "GO-2026-5676",
+        "GO-2026-5932",
+        "GO-2026-5942",
+        "GO-2026-5970",
+        "GO-2026-6303",
+        "GO-2026-6354",
+        "GO-2026-6355",
+        "GO-2026-6603",
+        "GO-2026-6610",
+        "GO-2026-6611",
+        "GO-2026-6612",
+        "GO-2026-6617",
+        "GO-2026-6629",
+        "GO-2026-6860",
+        "GO-2026-6866"
+      ],
+      "reachable_advisories": [
+        "GO-2024-2459",
+        "GO-2024-2682",
+        "GO-2024-3302",
+        "GO-2025-3485",
+        "GO-2025-3553",
+        "GO-2025-4017",
+        "GO-2025-4116",
+        "GO-2025-4233",
+        "GO-2026-4945",
+        "GO-2026-5018",
+        "GO-2026-5026",
+        "GO-2026-5676",
+        "GO-2026-5970"
+      ],
+      "config": {
+        "protocol_version": "v1.0.0",
+        "scanner_name": "govulncheck",
+        "scanner_version": "v1.9.0",
+        "db": "https://vuln.go.dev",
+        "db_last_modified": "2026-11-02T22:01:43Z",
+        "go_version": "go1.27.3",
+        "scan_level": "symbol",
+        "scan_mode": "source"
+      }
+    },
+    "updated": {
+      "module_advisories": [
+        "GO-2026-5932"
+      ],
+      "reachable_advisories": [],
+      "config": {
+        "protocol_version": "v1.0.0",
+        "scanner_name": "govulncheck",
+        "scanner_version": "v1.9.0",
+        "db": "https://vuln.go.dev",
+        "db_last_modified": "2026-11-02T22:01:43Z",
+        "go_version": "go1.27.3",
+        "scan_level": "symbol",
+        "scan_mode": "source"
+      }
+    },
+    "upstream": {
+      "module_advisories": [
+        "GO-2026-5932"
+      ],
+      "reachable_advisories": [],
+      "config": {
+        "protocol_version": "v1.0.0",
+        "scanner_name": "govulncheck",
+        "scanner_version": "v1.9.0",
+        "db": "https://vuln.go.dev",
+        "db_last_modified": "2026-11-02T22:01:43Z",
+        "go_version": "go1.27.3",
+        "scan_level": "module",
+        "scan_mode": "source"
+      }
+    }
+  },
+  "limitations": [
+    "Seven Rust agent tests require AF_UNIX creation; sandbox returns EPERM.",
+    "Seventeen legacy Go server integration specs require additional account/credential fixtures and binaries; their opt-in environment was unavailable.",
+    "OpenPGP advisory GO-2026-5932 is module-only; its affected packages are not imported. Stable golang.org/x/crypto v0.58.0 retained.",
+    "quic-go local replacement is independently checked against upstream v0.64.1; source hashes and the 53-line compatibility diff are supplied.",
+    "Existing active Rust rsa advisory RUSTSEC-2023-0071 remains; crypto-bigint 0.5.5 advisory is lockfile-only/unbuilt.",
+    "Cross-compiled binaries were built, not run on other operating systems.",
+    "No Daybreak/Cloud scan was run in this local validation."
+  ]
+}

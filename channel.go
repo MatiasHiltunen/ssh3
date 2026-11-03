@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	ssh3 "github.com/francoismichel/ssh3/message"
 	"github.com/francoismichel/ssh3/util"
-
-	"github.com/quic-go/quic-go"
 )
 
 type ChannelOpenFailure struct {
@@ -95,13 +94,14 @@ type channelImpl struct {
 	ChannelInfo
 	confirmSent     bool
 	confirmReceived bool
+	sendMutex       sync.Mutex
 	header          []byte
 
 	datagramSender util.SSH3DatagramSenderFunc
 
 	channelCloseListener
 
-	recv           quic.ReceiveStream
+	recv           ReceiveStream
 	send           io.WriteCloser
 	datagramsQueue *util.DatagramsQueue
 	PtyReqHandler
@@ -173,7 +173,7 @@ func parseHeader(channelID uint64, r util.Reader) (conversationControlStreamID C
 	if err != nil {
 		return 0, "", 0, err
 	}
-	return conversationControlStreamID, channelType, maxPacketSize, nil
+	return conversationControlStreamID, channelType, maxPacketSize, validatePacketSize(maxPacketSize)
 }
 
 func parseForwardingHeader(channelID uint64, buf util.Reader) (net.IP, uint16, error) {
@@ -228,7 +228,7 @@ func parseTCPForwardingHeader(channelID uint64, buf util.Reader) (*net.TCPAddr, 
 	}, nil
 }
 
-func NewChannel(conversationStreamID uint64, conversationID ConversationID, channelID uint64, channelType string, maxPacketSize uint64, recv quic.ReceiveStream,
+func NewChannel(conversationStreamID uint64, conversationID ConversationID, channelID uint64, channelType string, maxPacketSize uint64, recv ReceiveStream,
 	send io.WriteCloser, datagramSender util.SSH3DatagramSenderFunc, channelCloseListener channelCloseListener, sendHeader bool, confirmSent bool,
 	confirmReceived bool, datagramsQueueSize uint64, additonalHeaderBytes []byte) Channel {
 	var header []byte = nil
@@ -283,6 +283,9 @@ func (c *channelImpl) NextMessage() (ssh3.Message, error) {
 
 	switch message := genericMessage.(type) {
 	case *ssh3.ChannelOpenConfirmationMessage:
+		if err := validatePacketSize(message.MaxPacketSize); err != nil {
+			return nil, err
+		}
 		c.confirmReceived = true
 		// let's read the next message
 		return c.NextMessage()
@@ -298,18 +301,29 @@ func (c *channelImpl) NextMessage() (ssh3.Message, error) {
 }
 
 func (c *channelImpl) maybeSendHeader() error {
+	c.sendMutex.Lock()
+	defer c.sendMutex.Unlock()
+	return c.maybeSendHeaderLocked()
+}
+
+func (c *channelImpl) maybeSendHeaderLocked() error {
 	if len(c.header) > 0 {
 		written, err := c.send.Write(c.header)
 		if err != nil {
 			return err
 		}
 		c.header = c.header[written:]
+		if len(c.header) != 0 {
+			return io.ErrShortWrite
+		}
 	}
 	return nil
 }
 
 func (c *channelImpl) WriteData(dataBuf []byte, dataType ssh3.SSHDataType) (int, error) {
-	err := c.maybeSendHeader()
+	c.sendMutex.Lock()
+	defer c.sendMutex.Unlock()
+	err := c.maybeSendHeaderLocked()
 	if err != nil {
 		return 0, err
 	}
@@ -319,8 +333,12 @@ func (c *channelImpl) WriteData(dataBuf []byte, dataType ssh3.SSHDataType) (int,
 			DataType: dataType,
 			Data:     "",
 		}
-		emptyMsgLen := dataMsg.Length()
-		msgLen := util.MinUint64(c.ChannelInfo.MaxPacketSize-uint64(emptyMsgLen), uint64(len(dataBuf)))
+		if err := validatePacketSize(c.ChannelInfo.MaxPacketSize); err != nil {
+			return written, err
+		}
+		// Reserve the maximum possible varint size, not the empty string's one-byte prefix.
+		overhead := uint64(dataMsg.Length()) + 7
+		msgLen := util.MinUint64(c.ChannelInfo.MaxPacketSize-overhead, uint64(len(dataBuf)))
 
 		dataMsg.Data = string(dataBuf[:msgLen])
 		dataBuf = dataBuf[msgLen:]
@@ -331,10 +349,13 @@ func (c *channelImpl) WriteData(dataBuf []byte, dataType ssh3.SSHDataType) (int,
 			return written, err
 		}
 		n, err := c.send.Write(msgBuf)
-		written += n
+		if err == nil && n != len(msgBuf) {
+			err = io.ErrShortWrite
+		}
 		if err != nil {
 			return written, err
 		}
+		written += int(msgLen)
 	}
 	return written, nil
 }
@@ -348,7 +369,9 @@ func (c *channelImpl) confirmChannel(maxPacketSize uint64) error {
 }
 
 func (c *channelImpl) sendMessage(m ssh3.Message) error {
-	err := c.maybeSendHeader()
+	c.sendMutex.Lock()
+	defer c.sendMutex.Unlock()
+	err := c.maybeSendHeaderLocked()
 	if err != nil {
 		return err
 	}
@@ -357,8 +380,11 @@ func (c *channelImpl) sendMessage(m ssh3.Message) error {
 	if err != nil {
 		return err
 	}
-	c.send.Write(buf)
-	return nil
+	n, err := c.send.Write(buf)
+	if err == nil && n != len(buf) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 // blocks until the datagram is added
@@ -376,7 +402,9 @@ func (c *channelImpl) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 }
 
 func (c *channelImpl) SendDatagram(datagram []byte) error {
-	c.maybeSendHeader()
+	if err := c.maybeSendHeader(); err != nil {
+		return err
+	}
 	if c.datagramSender == nil {
 		return SentDatagramOnNonDatagramChannel{c.ChannelID()}
 	}
@@ -384,7 +412,6 @@ func (c *channelImpl) SendDatagram(datagram []byte) error {
 }
 
 func (c *channelImpl) SendRequest(r *ssh3.ChannelRequestMessage) error {
-	//TODO: make it thread safe
 	return c.sendMessage(r)
 }
 

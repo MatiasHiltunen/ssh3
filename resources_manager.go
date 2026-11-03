@@ -4,18 +4,18 @@ import (
 	"sync"
 
 	"github.com/francoismichel/ssh3/util"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go"
 )
 
 type ControlStreamID = uint64
 
 type conversationsManager struct {
-	connection    http3.StreamCreator
+	connection    *quic.Conn
 	conversations map[ControlStreamID]*Conversation
 	lock          sync.Mutex
 }
 
-func newConversationManager(connection http3.StreamCreator) *conversationsManager {
+func newConversationManager(connection *quic.Conn) *conversationsManager {
 	return &conversationsManager{connection: connection, conversations: make(map[ControlStreamID]*Conversation)}
 }
 
@@ -37,6 +37,9 @@ func (m *conversationsManager) removeConversation(conversation *Conversation) {
 	defer m.lock.Unlock()
 	delete(m.conversations, uint64(conversation.controlStream.StreamID()))
 }
+
+// At most 128 not-yet-open channels may buffer reordered QUIC datagrams.
+const maxDanglingDatagramChannels = 128
 
 type channelsManager struct {
 	channels            map[util.ChannelID]Channel
@@ -67,7 +70,11 @@ func (m *channelsManager) addDanglingDatagramsQueue(id util.ChannelID, queue *ut
 		for ; dgram != nil; dgram = queue.Next() {
 			channel.addDatagram(dgram)
 		}
-	} else {
+	} else if existing, ok := m.danglingDgramQueues[id]; ok {
+		for datagram := queue.Next(); datagram != nil; datagram = queue.Next() {
+			existing.Add(datagram)
+		}
+	} else if len(m.danglingDgramQueues) < maxDanglingDatagramChannels {
 		m.danglingDgramQueues[id] = queue
 	}
 }
