@@ -1,12 +1,15 @@
 package integration_tests
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"os"
 	"os/exec"
+	osuser "os/user"
 	"path"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gbytes"
 	. "github.com/onsi/gomega/gexec"
+	"golang.org/x/crypto/ssh"
 )
 
 var ssh3Path string
@@ -41,21 +45,44 @@ var oldServerBinds map[string]string = map[string]string{
 	"v0.1.5-rc5": "127.0.0.1:5001",
 } // tag version to bind string
 
-func IPv6LoopbackAvailable(addrs []net.Addr) bool {
-	for _, addr := range addrs {
-		Expect(addr).To(BeAssignableToTypeOf(&net.IPNet{}))
-		ip := addr.(*net.IPNet).IP
-		if ip.To4() == nil && ip.To16() != nil && ip.IsLoopback() {
-			// we found ::1, we can start the test
-			return true
-		}
+func IPv6LoopbackAvailable() bool {
+	// Probe the capability we need; interface enumeration may require netlink
+	// permissions even when IPv6 loopback sockets work.
+	conn, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		return false
 	}
-	return false
+	conn.Close()
+	return true
 }
 
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return !os.IsNotExist(err)
+}
+
+// Register cleanup immediately so a failed assertion cannot leak a child process.
+func startClient(command *exec.Cmd) *Session {
+	session, err := Start(command, GinkgoWriter, GinkgoWriter)
+	Expect(err).ToNot(HaveOccurred())
+	DeferCleanup(func() { session.Kill().Wait(5 * time.Second) })
+	return session
+}
+
+func replaceFixtureFile(filename string, contents []byte) {
+	original, err := os.ReadFile(filename)
+	existed := err == nil
+	if err != nil {
+		Expect(errors.Is(err, os.ErrNotExist)).To(BeTrue(), "read original fixture")
+	}
+	DeferCleanup(func() {
+		if existed {
+			Expect(os.WriteFile(filename, original, 0o644)).To(Succeed())
+		} else {
+			Expect(os.Remove(filename)).To(Succeed())
+		}
+	})
+	Expect(os.WriteFile(filename, contents, 0o644)).To(Succeed())
 }
 
 var _ = BeforeSuite(func() {
@@ -76,7 +103,7 @@ var _ = BeforeSuite(func() {
 			"-url-path", DEFAULT_URL_PATH,
 			"-cert", os.Getenv("CERT_PEM"),
 			"-key", os.Getenv("CERT_PRIV_KEY"))
-		serverCommand.Env = append(serverCommand.Env, "SSH3_LOG_LEVEL=debug")
+		serverCommand.Env = append(os.Environ(), "SSH3_LOG_LEVEL=debug")
 		session, err := Start(serverCommand, GinkgoWriter, GinkgoWriter)
 		Expect(err).ToNot(HaveOccurred())
 
@@ -88,6 +115,8 @@ var _ = BeforeSuite(func() {
 			cmd := exec.Command("go", "install", fmt.Sprintf("github.com/francoismichel/ssh3/cmd/ssh3-server@%s", tag))
 			cmd.Env = os.Environ()
 			cmd.Env = append(cmd.Env, fmt.Sprintf("GOBIN=%s", gobin))
+			cmd.Stdout, cmd.Stderr = GinkgoWriter, GinkgoWriter
+			DeferCleanup(os.RemoveAll, gobin)
 			err = cmd.Run()
 			Expect(err).ToNot(HaveOccurred())
 			serverPath := path.Join(gobin, "ssh3-server")
@@ -99,7 +128,7 @@ var _ = BeforeSuite(func() {
 				"-url-path", DEFAULT_URL_PATH,
 				"-cert", os.Getenv("CERT_PEM"),
 				"-key", os.Getenv("CERT_PRIV_KEY"))
-			serverCommand.Env = append(backwardsCompatibleServerCommand.Env, "SSH3_LOG_LEVEL=debug")
+			backwardsCompatibleServerCommand.Env = append(os.Environ(), "SSH3_LOG_LEVEL=debug")
 			session, err = Start(backwardsCompatibleServerCommand, GinkgoWriter, GinkgoWriter)
 			Expect(err).ToNot(HaveOccurred())
 			serverSessions[bind] = session
@@ -112,7 +141,7 @@ var _ = BeforeSuite(func() {
 			"-url-path", DEFAULT_PROXY_URL_PATH,
 			"-cert", os.Getenv("CERT_PEM"),
 			"-key", os.Getenv("CERT_PRIV_KEY"))
-		proxyServerCommand.Env = append(proxyServerCommand.Env, "SSH3_LOG_LEVEL=debug")
+		proxyServerCommand.Env = append(os.Environ(), "SSH3_LOG_LEVEL=debug")
 		proxyServerSession, err = Start(proxyServerCommand, GinkgoWriter, GinkgoWriter)
 		Expect(err).ToNot(HaveOccurred())
 
@@ -126,15 +155,16 @@ var _ = BeforeSuite(func() {
 		ecdsaUsername = os.Getenv("ECDSATESTUSER_USERNAME")
 		Expect(fileExists(rsaPrivKeyPath)).To(BeTrue())
 		Expect(fileExists(attackerPrivKeyPath)).To(BeTrue())
-		err = os.WriteFile(fmt.Sprintf("/home/%s/.profile", username), []byte("echo 'hello from .profile'"), 0777)
+		user, err := osuser.Lookup(username)
 		Expect(err).ToNot(HaveOccurred())
+		replaceFixtureFile(path.Join(user.HomeDir, ".profile"), []byte("echo 'hello from .profile'\n"))
 	}
 })
 
 var _ = AfterSuite(func() {
 	CleanupBuildArtifacts()
 	for _, serverSession := range serverSessions {
-		serverSession.Terminate()
+		serverSession.Kill().Wait(5 * time.Second)
 	}
 })
 
@@ -143,8 +173,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 	Context("Usage", func() {
 		It("Displays the help", func() {
 			command := exec.Command(ssh3Path, "-h")
-			session, err := Start(command, GinkgoWriter, GinkgoWriter)
-			Expect(err).ToNot(HaveOccurred())
+			session := startClient(command)
 			Eventually(session).Should(Exit(0))
 			Expect(session.Err.Contents()).To(ContainSubstring("Usage of"))
 		})
@@ -178,8 +207,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 				It("Should connect using an RSA privkey", func() {
 					clientArgs = append(getClientArgs(rsaPrivKeyPath), "echo", "Hello, World!")
 					command := exec.Command(ssh3Path, clientArgs...)
-					session, err := Start(command, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session := startClient(command)
 					Eventually(session).Should(Exit(0))
 					Eventually(session).Should(Say("Hello, World!\n"))
 				})
@@ -187,8 +215,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 				It("Should connect using an RSA privkey through proxy jump", func() {
 					clientArgs = append(getClientArgs(rsaPrivKeyPath, "-proxy-jump", fmt.Sprintf("%s@%s%s", username, proxyServerBind, DEFAULT_PROXY_URL_PATH)), "echo", "Hello, World!")
 					command := exec.Command(ssh3Path, clientArgs...)
-					session, err := Start(command, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session := startClient(command)
 					Eventually(session).Should(Exit(0))
 					Eventually(session).Should(Say("Hello, World!\n"))
 				})
@@ -200,8 +227,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 						It("Should connect using an RSA privkey to old supported server", func() {
 							clientArgs = append(getClientArgsWithBind(rsaPrivKeyPath, bind), "echo", "Hello, World!")
 							command := exec.Command(ssh3Path, clientArgs...)
-							session, err := Start(command, GinkgoWriter, GinkgoWriter)
-							Expect(err).ToNot(HaveOccurred())
+							session := startClient(command)
 							Eventually(session).Should(Exit(0))
 							Eventually(session).Should(Say("Hello, World!\n"))
 						})
@@ -211,13 +237,22 @@ var _ = Describe("Testing the ssh3 cli", func() {
 				It("Should connect using an ed25519 privkey", func() {
 					clientArgs = append(getClientArgs(ed25519PrivKeyPath), "echo", "Hello, World!")
 					command := exec.Command(ssh3Path, clientArgs...)
-					session, err := Start(command, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session := startClient(command)
 					Eventually(session).Should(Exit(0))
 					Eventually(session).Should(Say("Hello, World!\n"))
 				})
 
 				It("Should connect using an ecdsa privkey", func() {
+					if ecdsaUsername == username {
+						user, err := osuser.Lookup(username)
+						Expect(err).ToNot(HaveOccurred())
+						privateKey, err := os.ReadFile(ecdsaPrivKeyPath)
+						Expect(err).ToNot(HaveOccurred())
+						signer, err := ssh.ParsePrivateKey(privateKey)
+						Expect(err).ToNot(HaveOccurred())
+						replaceFixtureFile(path.Join(user.HomeDir, ".ssh3", "authorized_identities"), ssh.MarshalAuthorizedKey(signer.PublicKey()))
+					}
+
 					// for retrocopatibility integration tests with version 0.1.5, we must perform ecdsa tests
 					// for another user as ecdsa is not available on the server on older versions
 					savedUsername := username
@@ -225,10 +260,19 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					clientArgs = append(getClientArgs(ecdsaPrivKeyPath), "echo", "Hello, World!")
 					username = savedUsername
 					command := exec.Command(ssh3Path, clientArgs...)
-					session, err := Start(command, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session := startClient(command)
 					Eventually(session).Should(Exit(0))
 					Eventually(session).Should(Say("Hello, World!\n"))
+				})
+
+				It("preserves stdout and stderr from fast commands before exit status", func() {
+					for range 12 {
+						args := append(getClientArgs(rsaPrivKeyPath), "printf '__ssh3_stdout__'; printf '__ssh3_stderr__' >&2")
+						session := startClient(exec.Command(ssh3Path, args...))
+						Eventually(session).Should(Exit(0))
+						Expect(session.Out.Contents()).To(ContainSubstring("__ssh3_stdout__"))
+						Expect(session.Err.Contents()).To(ContainSubstring("__ssh3_stderr__"))
+					}
 				})
 
 				It("Should return the correct exit status", func() {
@@ -238,23 +282,19 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					clientArgsMinus1 := append(getClientArgs(rsaPrivKeyPath), "exit", "-1")
 
 					command0 := exec.Command(ssh3Path, clientArgs0...)
-					session, err := Start(command0, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session := startClient(command0)
 					Eventually(session).Should(Exit(0))
 
 					command1 := exec.Command(ssh3Path, clientArgs1...)
-					session, err = Start(command1, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session = startClient(command1)
 					Eventually(session).Should(Exit(1))
 
 					command255 := exec.Command(ssh3Path, clientArgs255...)
-					session, err = Start(command255, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session = startClient(command255)
 					Eventually(session).Should(Exit(255))
 
 					commandMinus1 := exec.Command(ssh3Path, clientArgsMinus1...)
-					session, err = Start(commandMinus1, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session = startClient(commandMinus1)
 					Eventually(session).Should(Exit(255))
 				})
 
@@ -263,8 +303,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					command := exec.Command(ssh3Path, clientArgs...)
 					stdin, err := command.StdinPipe()
 					Expect(err).ToNot(HaveOccurred())
-					session, err := Start(command, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session := startClient(command)
 					Consistently(session).ShouldNot(Exit())
 					Eventually(session.Out).Should(Say("hello from .profile"))
 					_, err = stdin.Write([]byte("exit\n")) // 0x04 = EOT character, closing the bash session
@@ -277,87 +316,74 @@ var _ = Describe("Testing the ssh3 cli", func() {
 				// through the SSH3 connection towards the specified remote IP and port.
 				Context("TCP port forwarding", func() {
 					testTCPPortForwarding := func(localPort uint16, proxyJump bool, remoteAddr *net.TCPAddr, messageFromClient string, messageFromServer string) {
-						localIP := "[::1]"
+						localIP := "::1"
 						if remoteAddr.IP.To4() != nil {
 							localIP = "127.0.0.1"
 						}
-						serverStarted := make(chan struct{})
-						// Start a TCP server on the specified remote IP and port
+						ctx, cancel := context.WithCancel(context.Background())
+						listener, err := net.ListenTCP("tcp", remoteAddr)
+						Expect(err).ToNot(HaveOccurred())
+						serverDone := make(chan struct{})
+						DeferCleanup(func() {
+							cancel()
+							listener.Close()
+							Eventually(serverDone, 5*time.Second).Should(BeClosed())
+						})
 						go func() {
-							defer close(serverStarted)
+							defer close(serverDone)
 							defer GinkgoRecover()
-							listener, err := net.ListenTCP("tcp", remoteAddr)
-							Expect(err).ToNot(HaveOccurred())
-							defer listener.Close()
-
-							serverStarted <- struct{}{}
-
-							conn, err := listener.Accept()
+							conn, err := listener.AcceptTCP()
+							if err != nil && ctx.Err() != nil {
+								return
+							}
 							Expect(err).ToNot(HaveOccurred())
 							defer conn.Close()
-
-							// Read message from client
+							stop := context.AfterFunc(ctx, func() { conn.Close() })
+							defer stop()
+							Expect(conn.SetDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
 							buffer := make([]byte, len(messageFromClient))
-							_, err = conn.Read(buffer)
+							_, err = io.ReadFull(conn, buffer)
+							if err != nil && ctx.Err() != nil {
+								return
+							}
 							Expect(err).ToNot(HaveOccurred())
 							Expect(string(buffer)).To(Equal(messageFromClient))
-
-							// Send message to client
 							_, err = conn.Write([]byte(messageFromServer))
+							if err != nil && ctx.Err() != nil {
+								return
+							}
 							Expect(err).ToNot(HaveOccurred())
-							conn.(*net.TCPConn).CloseWrite()
-
-							// Read from the client after receiving the message, assert EOF
+							Expect(conn.CloseWrite()).To(Succeed())
 							n, err := conn.Read(buffer)
+							if err != nil && ctx.Err() != nil {
+								return
+							}
 							Expect(err).To(Equal(io.EOF))
 							Expect(n).To(Equal(0))
 						}()
-
-						Eventually(serverStarted).Should(Receive())
-						// Execute the client with TCP port forwarding
-
 						additionalArgs := []string{}
 						if proxyJump {
 							additionalArgs = append(additionalArgs, "-proxy-jump", fmt.Sprintf("%s@%s%s", username, proxyServerBind, DEFAULT_PROXY_URL_PATH))
 						}
 						additionalArgs = append(additionalArgs, "-forward-tcp", fmt.Sprintf("%d/%s@%d", localPort, remoteAddr.IP, remoteAddr.Port))
-						clientArgs := getClientArgs(rsaPrivKeyPath, additionalArgs...)
-						command := exec.Command(ssh3Path, clientArgs...)
-						session, err := Start(command, GinkgoWriter, GinkgoWriter)
-						Expect(err).ToNot(HaveOccurred())
-						defer session.Terminate()
-
-						// Try to connect to the local forwarded port
+						session := startClient(exec.Command(ssh3Path, getClientArgs(rsaPrivKeyPath, additionalArgs...)...))
 						localAddr := net.JoinHostPort(localIP, fmt.Sprint(localPort))
 						var conn net.Conn
-						// connection refused might happen betwen the time when the process starts and actually listens the socket
 						Eventually(func() error {
 							var err error
-							conn, err = net.Dial("tcp", localAddr)
+							conn, err = net.DialTimeout("tcp", localAddr, time.Second)
 							return err
-						}).ShouldNot(HaveOccurred())
+						}, 5*time.Second).Should(Succeed(), "%s", session.Err.Contents())
+						DeferCleanup(conn.Close)
+						Expect(conn.SetDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
+						_, err = conn.Write([]byte(messageFromClient))
 						Expect(err).ToNot(HaveOccurred())
-						defer conn.Close()
-
-						// Send message from client
-						n, err := conn.Write([]byte(messageFromClient))
-						Expect(err).ToNot(HaveOccurred())
-						Expect(n).To(Equal(len(messageFromClient)))
-
-						// Close the client-side connection
-						conn.(*net.TCPConn).CloseWrite()
-
-						// Read message from server
+						Expect(conn.(*net.TCPConn).CloseWrite()).To(Succeed())
 						buffer := make([]byte, len(messageFromServer))
-						conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-						n, err = conn.Read(buffer)
+						_, err = io.ReadFull(conn, buffer)
 						Expect(err).ToNot(HaveOccurred())
-						Expect(n).To(Equal(len(messageFromServer)))
-						Expect(string(buffer[:n])).To(Equal(messageFromServer))
-
-						// If the messages are correctly exchanged, the forwarding is working as expected
-						// Now, check that the TCP conn is well closed and that no additional byte was sent
-						n, err = conn.Read(buffer)
+						Expect(string(buffer)).To(Equal(messageFromServer))
+						n, err := conn.Read(buffer)
 						Expect(n).To(Equal(0))
 						Expect(err).To(Equal(io.EOF))
 					}
@@ -386,9 +412,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					It("works with IPv6 addresses", func() {
 						// we first have to check whether IPv6 are enabled on that host, it is still often
 						// not the case in many Docker containers...
-						addrs, err := net.InterfaceAddrs()
-						Expect(err).ToNot(HaveOccurred())
-						if !IPv6LoopbackAvailable(addrs) {
+						if !IPv6LoopbackAvailable() {
 							Skip("IPv6 not available on this host")
 						}
 						testTCPPortForwarding(8082, false, &net.TCPAddr{IP: net.ParseIP("::1"), Port: 9091}, "hello from client", "hello from server")
@@ -400,72 +424,61 @@ var _ = Describe("Testing the ssh3 cli", func() {
 			// a UDP socket is indeed well open on the client and is indeed forwarded
 			// through the SSH3 connection towards the specified remote IP and port.
 			Context("UDP port forwarding", func() {
-				testUDPPortForwarding := func(localPort uint16, proxyJump bool, remoteAddr *net.UDPAddr, messageFromClient, messageFromServer string) {
-					localIP := "[::1]"
-					localIPWithoutBrackets := "::1"
+				testUDPPortForwarding := func(localPort uint16, proxyJump bool, remoteAddr *net.UDPAddr, messageFromClient, messageFromServer string, oversizedFirst ...bool) {
+					localIP := "::1"
 					if remoteAddr.IP.To4() != nil {
 						localIP = "127.0.0.1"
-						localIPWithoutBrackets = localIP
 					}
-					serverStarted := make(chan struct{})
-					// Start a UDP server on the specified remote IP and port
+					sendOversized := len(oversizedFirst) > 0 && oversizedFirst[0]
+					ctx, cancel := context.WithCancel(context.Background())
+					remoteConn, err := net.ListenUDP("udp", remoteAddr)
+					Expect(err).ToNot(HaveOccurred())
+					serverDone := make(chan struct{})
+					DeferCleanup(func() {
+						cancel()
+						remoteConn.Close()
+						Eventually(serverDone, 5*time.Second).Should(BeClosed())
+					})
 					go func() {
-						defer close(serverStarted)
+						defer close(serverDone)
 						defer GinkgoRecover()
-						conn, err := net.ListenUDP("udp", remoteAddr)
-						Expect(err).ToNot(HaveOccurred())
-						defer conn.Close()
-
-						serverStarted <- struct{}{}
-
+						Expect(remoteConn.SetReadDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
 						buffer := make([]byte, 2*len(messageFromClient))
-						n, clientAddr, err := conn.ReadFromUDP(buffer)
+						n, clientAddr, err := remoteConn.ReadFromUDP(buffer)
+						if err != nil && ctx.Err() != nil {
+							return
+						}
 						Expect(err).ToNot(HaveOccurred())
-						Expect(clientAddr.IP.String()).To(Equal(localIPWithoutBrackets))
+						Expect(clientAddr.IP.String()).To(Equal(localIP))
 						Expect(string(buffer[:n])).To(Equal(messageFromClient))
-
-						// Send message to client
-						_, err = conn.WriteToUDP([]byte(messageFromServer), clientAddr)
+						if sendOversized {
+							_, err = remoteConn.WriteToUDP(make([]byte, 1500), clientAddr)
+							Expect(err).ToNot(HaveOccurred())
+						}
+						_, err = remoteConn.WriteToUDP([]byte(messageFromServer), clientAddr)
 						Expect(err).ToNot(HaveOccurred())
 					}()
-
-					Eventually(serverStarted).Should(Receive())
-					// Execute the client with UDP port forwarding
-
 					additionalArgs := []string{}
 					if proxyJump {
 						additionalArgs = append(additionalArgs, "-proxy-jump", fmt.Sprintf("%s@%s%s", username, proxyServerBind, DEFAULT_PROXY_URL_PATH))
 					}
 					additionalArgs = append(additionalArgs, "-forward-udp", fmt.Sprintf("%d/%s@%d", localPort, remoteAddr.IP, remoteAddr.Port))
-					clientArgs := getClientArgs(rsaPrivKeyPath, additionalArgs...)
-					command := exec.Command(ssh3Path, clientArgs...)
-					session, err := Start(command, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
-					defer session.Terminate()
-
-					// Wait for some time to ensure that the client has established the forwarding
-					time.Sleep(2 * time.Second)
-
-					// if the remote addr is IPv4 (resp. IPv6), ssh3 listens on the IPv4 (resp. IPv6) loopback
-					// Try to connect to the local forwarded port
+					session := startClient(exec.Command(ssh3Path, getClientArgs(rsaPrivKeyPath, additionalArgs...)...))
+					// RunSession starts only after ForwardUDP has bound its listener.
+					Eventually(session.Err, 5*time.Second).Should(Say("opened new session channel"))
 					localAddr := net.JoinHostPort(localIP, fmt.Sprint(localPort))
-
-					var conn net.Conn
-					Eventually(func() error {
-						var err error
-						conn, err = net.Dial("udp", localAddr)
-						return err
-					}).ShouldNot(HaveOccurred())
-					defer conn.Close()
-
-					// Send message from client
+					conn, err := net.Dial("udp", localAddr)
+					Expect(err).ToNot(HaveOccurred())
+					DeferCleanup(conn.Close)
+					Expect(conn.SetDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
+					if sendOversized {
+						_, err = conn.Write(make([]byte, 1500))
+						Expect(err).ToNot(HaveOccurred())
+					}
 					n, err := conn.Write([]byte(messageFromClient))
 					Expect(err).ToNot(HaveOccurred())
 					Expect(n).To(Equal(len(messageFromClient)))
-
-					// Read message from server
 					buffer := make([]byte, 2*len(messageFromServer))
-					conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 					n, err = conn.Read(buffer)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(n).To(Equal(len(messageFromServer)))
@@ -495,11 +508,13 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					testUDPPortForwarding(8081, false, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9090}, string(messageFromClient), string(messageFromServer))
 				})
 
+				It("keeps forwarding after oversized datagrams in either direction", func() {
+					testUDPPortForwarding(8081, false, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9090}, "hello after oversized client packet", "hello after oversized server packet", true)
+				})
+
 				It("works with IPv6 addresses", func() {
 					// Check whether IPv6 is available on the host
-					addrs, err := net.InterfaceAddrs()
-					Expect(err).ToNot(HaveOccurred())
-					if !IPv6LoopbackAvailable(addrs) {
+					if !IPv6LoopbackAvailable() {
 						Skip("IPv6 not available on this host")
 					}
 					testUDPPortForwarding(8082, false, &net.UDPAddr{IP: net.ParseIP("::1"), Port: 9091}, "hello from client", "hello from server")
@@ -512,8 +527,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					clientArgs = append(getClientArgs(attackerPrivKeyPath), "echo", "Hello, World!")
 
 					command := exec.Command(ssh3Path, clientArgs...)
-					session, err := Start(command, GinkgoWriter, GinkgoWriter)
-					Expect(err).ToNot(HaveOccurred())
+					session := startClient(command)
 					Eventually(session).Should(Exit())
 					Eventually(session).ShouldNot(Exit(0))
 					Eventually(string(session.Wait().Err.Contents())).Should(ContainSubstring("unauthorized"))

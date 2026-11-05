@@ -120,9 +120,9 @@ func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripp
 
 	select {
 	case <-raw.ReceivedSettings():
-		if !raw.Settings().EnableExtendedConnect {
-			return fmt.Errorf("server does not support HTTP/3 Extended CONNECT")
-		}
+		// Supported SSH3 0.1.5 servers implement CONNECT without advertising the
+		// later HTTP/3 setting. Keep version negotiation, TLS and auth checks below.
+
 	case <-req.Context().Done():
 		return req.Context().Err()
 	case <-qconn.Context().Done():
@@ -229,6 +229,9 @@ func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripp
 				if convID == uint64(c.controlStream.StreamID()) {
 					err = c.AddDatagram(c.Context(), dgram[buf.Size()-int64(buf.Len()):])
 					if err != nil {
+						if _, queued := err.(util.ChannelNotFound); queued {
+							continue
+						}
 						log.Error().Msgf("could not add datagram to conv id %d: %s", c.controlStream.StreamID(), err)
 						return
 					}

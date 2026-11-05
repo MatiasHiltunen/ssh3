@@ -168,6 +168,12 @@ func forwardUDPInBackground(ctx context.Context, channel ssh3.Channel, conn *net
 			}
 			err = channel.SendDatagram(buf[:n])
 			if err != nil {
+				var tooLarge *quic.DatagramTooLargeError
+				if errors.As(err, &tooLarge) {
+					// UDP is unreliable: drop MTU probes/oversized packets, not the tunnel.
+					log.Debug().Int("bytes", n).Msg("dropping UDP datagram larger than QUIC payload limit")
+					continue
+				}
 				log.Error().Msgf("could send datagram on channel: %s", err)
 				return
 			}
@@ -319,7 +325,10 @@ func execCmdInBackground(channel ssh3.Channel, user *unix_util.User, session *ru
 		execResultChan := make(chan error, 1)
 		execExitStatus := uint64(0)
 
+		var outputReaders sync.WaitGroup
+		outputReaders.Add(2)
 		readStdout := func() {
+			defer outputReaders.Done()
 			defer close(stdoutChan)
 			if runningCommand.stdoutR != nil {
 				for {
@@ -335,6 +344,7 @@ func execCmdInBackground(channel ssh3.Channel, user *unix_util.User, session *ru
 			}
 		}
 		readStderr := func() {
+			defer outputReaders.Done()
 			defer close(stderrChan)
 			if runningCommand.stderrR != nil {
 				for {
@@ -353,6 +363,9 @@ func execCmdInBackground(channel ssh3.Channel, user *unix_util.User, session *ru
 		go readStdout()
 		go readStderr()
 		go func() {
+			// Wait closes StdoutPipe/StderrPipe; drain both first so fast commands
+			// cannot lose their output before we send their exit status.
+			outputReaders.Wait()
 			execResultChan <- runningCommand.Wait()
 			close(execResultChan)
 		}()
@@ -498,18 +511,6 @@ func newCommand(user *unix_util.User, channel ssh3.Channel, loginShell bool, com
 		stdinW = session.pty.pty
 		cmd, _, _, _, err = user.CreateCommand(env, stdoutW, stderrW, stdinR, loginShell, command, args...)
 	} else {
-		stdoutR, stdoutW, err = os.Pipe()
-		if err != nil {
-			return err
-		}
-		stderrR, stderrW, err = os.Pipe()
-		if err != nil {
-			return err
-		}
-		stdinR, stdinW, err = os.Pipe()
-		if err != nil {
-			return err
-		}
 		cmd, stdoutR, stderrR, stdinW, err = user.CreateCommandPipeOutput(env, loginShell, command, args...)
 	}
 
